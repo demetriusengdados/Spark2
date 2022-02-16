@@ -15,330 +15,635 @@
 # limitations under the License.
 #
 
-import array
 import sys
-from collections import namedtuple
 
-from pyspark import SparkContext, since
-from pyspark.rdd import RDD
-from pyspark.mllib.common import JavaModelWrapper, callMLlibFunc, inherit_doc
-from pyspark.mllib.util import JavaLoader, JavaSaveable
-from pyspark.sql import DataFrame
+from pyspark import since, keyword_only
+from pyspark.ml.param.shared import HasPredictionCol, HasBlockSize, HasMaxIter, HasRegParam, \
+    HasCheckpointInterval, HasSeed
+from pyspark.ml.wrapper import JavaEstimator, JavaModel
+from pyspark.ml.common import inherit_doc
+from pyspark.ml.param import Params, TypeConverters, Param
+from pyspark.ml.util import JavaMLWritable, JavaMLReadable
 
-__all__ = ['MatrixFactorizationModel', 'ALS', 'Rating']
 
-
-class Rating(namedtuple("Rating", ["user", "product", "rating"])):
-    """
-    Represents a (user, product, rating) tuple.
-
-    .. versionadded:: 1.2.0
-
-    Examples
-    --------
-    >>> r = Rating(1, 2, 5.0)
-    >>> (r.user, r.product, r.rating)
-    (1, 2, 5.0)
-    >>> (r[0], r[1], r[2])
-    (1, 2, 5.0)
-    """
-
-    def __reduce__(self):
-        return Rating, (int(self.user), int(self.product), float(self.rating))
+__all__ = ['ALS', 'ALSModel']
 
 
 @inherit_doc
-class MatrixFactorizationModel(JavaModelWrapper, JavaSaveable, JavaLoader):
+class _ALSModelParams(HasPredictionCol, HasBlockSize):
+    """
+    Params for :py:class:`ALS` and :py:class:`ALSModel`.
 
-    """A matrix factorisation model trained by regularized alternating
-    least-squares.
+    .. versionadded:: 3.0.0
+    """
 
-    .. versionadded:: 0.9.0
+    userCol = Param(Params._dummy(), "userCol", "column name for user ids. Ids must be within " +
+                    "the integer value range.", typeConverter=TypeConverters.toString)
+    itemCol = Param(Params._dummy(), "itemCol", "column name for item ids. Ids must be within " +
+                    "the integer value range.", typeConverter=TypeConverters.toString)
+    coldStartStrategy = Param(Params._dummy(), "coldStartStrategy", "strategy for dealing with " +
+                              "unknown or new users/items at prediction time. This may be useful " +
+                              "in cross-validation or production scenarios, for handling " +
+                              "user/item ids the model has not seen in the training data. " +
+                              "Supported values: 'nan', 'drop'.",
+                              typeConverter=TypeConverters.toString)
+
+    def __init__(self, *args):
+        super(_ALSModelParams, self).__init__(*args)
+        self._setDefault(blockSize=4096)
+
+    @since("1.4.0")
+    def getUserCol(self):
+        """
+        Gets the value of userCol or its default value.
+        """
+        return self.getOrDefault(self.userCol)
+
+    @since("1.4.0")
+    def getItemCol(self):
+        """
+        Gets the value of itemCol or its default value.
+        """
+        return self.getOrDefault(self.itemCol)
+
+    @since("2.2.0")
+    def getColdStartStrategy(self):
+        """
+        Gets the value of coldStartStrategy or its default value.
+        """
+        return self.getOrDefault(self.coldStartStrategy)
+
+
+@inherit_doc
+class _ALSParams(_ALSModelParams, HasMaxIter, HasRegParam, HasCheckpointInterval, HasSeed):
+    """
+    Params for :py:class:`ALS`.
+
+    .. versionadded:: 3.0.0
+    """
+
+    rank = Param(Params._dummy(), "rank", "rank of the factorization",
+                 typeConverter=TypeConverters.toInt)
+    numUserBlocks = Param(Params._dummy(), "numUserBlocks", "number of user blocks",
+                          typeConverter=TypeConverters.toInt)
+    numItemBlocks = Param(Params._dummy(), "numItemBlocks", "number of item blocks",
+                          typeConverter=TypeConverters.toInt)
+    implicitPrefs = Param(Params._dummy(), "implicitPrefs", "whether to use implicit preference",
+                          typeConverter=TypeConverters.toBoolean)
+    alpha = Param(Params._dummy(), "alpha", "alpha for implicit preference",
+                  typeConverter=TypeConverters.toFloat)
+
+    ratingCol = Param(Params._dummy(), "ratingCol", "column name for ratings",
+                      typeConverter=TypeConverters.toString)
+    nonnegative = Param(Params._dummy(), "nonnegative",
+                        "whether to use nonnegative constraint for least squares",
+                        typeConverter=TypeConverters.toBoolean)
+    intermediateStorageLevel = Param(Params._dummy(), "intermediateStorageLevel",
+                                     "StorageLevel for intermediate datasets. Cannot be 'NONE'.",
+                                     typeConverter=TypeConverters.toString)
+    finalStorageLevel = Param(Params._dummy(), "finalStorageLevel",
+                              "StorageLevel for ALS model factors.",
+                              typeConverter=TypeConverters.toString)
+
+    def __init__(self, *args):
+        super(_ALSParams, self).__init__(*args)
+        self._setDefault(rank=10, maxIter=10, regParam=0.1, numUserBlocks=10, numItemBlocks=10,
+                         implicitPrefs=False, alpha=1.0, userCol="user", itemCol="item",
+                         ratingCol="rating", nonnegative=False, checkpointInterval=10,
+                         intermediateStorageLevel="MEMORY_AND_DISK",
+                         finalStorageLevel="MEMORY_AND_DISK", coldStartStrategy="nan")
+
+    @since("1.4.0")
+    def getRank(self):
+        """
+        Gets the value of rank or its default value.
+        """
+        return self.getOrDefault(self.rank)
+
+    @since("1.4.0")
+    def getNumUserBlocks(self):
+        """
+        Gets the value of numUserBlocks or its default value.
+        """
+        return self.getOrDefault(self.numUserBlocks)
+
+    @since("1.4.0")
+    def getNumItemBlocks(self):
+        """
+        Gets the value of numItemBlocks or its default value.
+        """
+        return self.getOrDefault(self.numItemBlocks)
+
+    @since("1.4.0")
+    def getImplicitPrefs(self):
+        """
+        Gets the value of implicitPrefs or its default value.
+        """
+        return self.getOrDefault(self.implicitPrefs)
+
+    @since("1.4.0")
+    def getAlpha(self):
+        """
+        Gets the value of alpha or its default value.
+        """
+        return self.getOrDefault(self.alpha)
+
+    @since("1.4.0")
+    def getRatingCol(self):
+        """
+        Gets the value of ratingCol or its default value.
+        """
+        return self.getOrDefault(self.ratingCol)
+
+    @since("1.4.0")
+    def getNonnegative(self):
+        """
+        Gets the value of nonnegative or its default value.
+        """
+        return self.getOrDefault(self.nonnegative)
+
+    @since("2.0.0")
+    def getIntermediateStorageLevel(self):
+        """
+        Gets the value of intermediateStorageLevel or its default value.
+        """
+        return self.getOrDefault(self.intermediateStorageLevel)
+
+    @since("2.0.0")
+    def getFinalStorageLevel(self):
+        """
+        Gets the value of finalStorageLevel or its default value.
+        """
+        return self.getOrDefault(self.finalStorageLevel)
+
+
+@inherit_doc
+class ALS(JavaEstimator, _ALSParams, JavaMLWritable, JavaMLReadable):
+    """
+    Alternating Least Squares (ALS) matrix factorization.
+
+    ALS attempts to estimate the ratings matrix `R` as the product of
+    two lower-rank matrices, `X` and `Y`, i.e. `X * Yt = R`. Typically
+    these approximations are called 'factor' matrices. The general
+    approach is iterative. During each iteration, one of the factor
+    matrices is held constant, while the other is solved for using least
+    squares. The newly-solved factor matrix is then held constant while
+    solving for the other factor matrix.
+
+    This is a blocked implementation of the ALS factorization algorithm
+    that groups the two sets of factors (referred to as "users" and
+    "products") into blocks and reduces communication by only sending
+    one copy of each user vector to each product block on each
+    iteration, and only for the product blocks that need that user's
+    feature vector. This is achieved by pre-computing some information
+    about the ratings matrix to determine the "out-links" of each user
+    (which blocks of products it will contribute to) and "in-link"
+    information for each product (which of the feature vectors it
+    receives from each user block it will depend on). This allows us to
+    send only an array of feature vectors between each user block and
+    product block, and have the product block find the users' ratings
+    and update the products based on these messages.
+
+    For implicit preference data, the algorithm used is based on
+    `"Collaborative Filtering for Implicit Feedback Datasets",
+    <https://doi.org/10.1109/ICDM.2008.22>`_, adapted for the blocked
+    approach used here.
+
+    Essentially instead of finding the low-rank approximations to the
+    rating matrix `R`, this finds the approximations for a preference
+    matrix `P` where the elements of `P` are 1 if r > 0 and 0 if r <= 0.
+    The ratings then act as 'confidence' values related to strength of
+    indicated user preferences rather than explicit ratings given to
+    items.
+
+    .. versionadded:: 1.4.0
+
+    Notes
+    -----
+    The input rating dataframe to the ALS implementation should be deterministic.
+    Nondeterministic data can cause failure during fitting ALS model.
+    For example, an order-sensitive operation like sampling after a repartition makes
+    dataframe output nondeterministic, like `df.repartition(2).sample(False, 0.5, 1618)`.
+    Checkpointing sampled dataframe or adding a sort before sampling can help make the
+    dataframe deterministic.
 
     Examples
     --------
-    >>> r1 = (1, 1, 1.0)
-    >>> r2 = (1, 2, 2.0)
-    >>> r3 = (2, 1, 2.0)
-    >>> ratings = sc.parallelize([r1, r2, r3])
-    >>> model = ALS.trainImplicit(ratings, 1, seed=10)
-    >>> model.predict(2, 2)
-    0.4...
-
-    >>> testset = sc.parallelize([(1, 2), (1, 1)])
-    >>> model = ALS.train(ratings, 2, seed=0)
-    >>> model.predictAll(testset).collect()
-    [Rating(user=1, product=1, rating=1.0...), Rating(user=1, product=2, rating=1.9...)]
-
-    >>> model = ALS.train(ratings, 4, seed=10)
-    >>> model.userFeatures().collect()
-    [(1, array('d', [...])), (2, array('d', [...]))]
-
-    >>> model.recommendUsers(1, 2)
-    [Rating(user=2, product=1, rating=1.9...), Rating(user=1, product=1, rating=1.0...)]
-    >>> model.recommendProducts(1, 2)
-    [Rating(user=1, product=2, rating=1.9...), Rating(user=1, product=1, rating=1.0...)]
+    >>> df = spark.createDataFrame(
+    ...     [(0, 0, 4.0), (0, 1, 2.0), (1, 1, 3.0), (1, 2, 4.0), (2, 1, 1.0), (2, 2, 5.0)],
+    ...     ["user", "item", "rating"])
+    >>> als = ALS(rank=10, seed=0)
+    >>> als.setMaxIter(5)
+    ALS...
+    >>> als.getMaxIter()
+    5
+    >>> als.setRegParam(0.1)
+    ALS...
+    >>> als.getRegParam()
+    0.1
+    >>> als.clear(als.regParam)
+    >>> model = als.fit(df)
+    >>> model.getBlockSize()
+    4096
+    >>> model.getUserCol()
+    'user'
+    >>> model.setUserCol("user")
+    ALSModel...
+    >>> model.getItemCol()
+    'item'
+    >>> model.setPredictionCol("newPrediction")
+    ALS...
     >>> model.rank
-    4
-
-    >>> first_user = model.userFeatures().take(1)[0]
-    >>> latents = first_user[1]
-    >>> len(latents)
-    4
-
-    >>> model.productFeatures().collect()
-    [(1, array('d', [...])), (2, array('d', [...]))]
-
-    >>> first_product = model.productFeatures().take(1)[0]
-    >>> latents = first_product[1]
-    >>> len(latents)
-    4
-
-    >>> products_for_users = model.recommendProductsForUsers(1).collect()
-    >>> len(products_for_users)
-    2
-    >>> products_for_users[0]
-    (1, (Rating(user=1, product=2, rating=...),))
-
-    >>> users_for_products = model.recommendUsersForProducts(1).collect()
-    >>> len(users_for_products)
-    2
-    >>> users_for_products[0]
-    (1, (Rating(user=2, product=1, rating=...),))
-
-    >>> model = ALS.train(ratings, 1, nonnegative=True, seed=123456789)
-    >>> model.predict(2, 2)
-    3.73...
-
-    >>> df = sqlContext.createDataFrame([Rating(1, 1, 1.0), Rating(1, 2, 2.0), Rating(2, 1, 2.0)])
-    >>> model = ALS.train(df, 1, nonnegative=True, seed=123456789)
-    >>> model.predict(2, 2)
-    3.73...
-
-    >>> model = ALS.trainImplicit(ratings, 1, nonnegative=True, seed=123456789)
-    >>> model.predict(2, 2)
-    0.4...
-
-    >>> import os, tempfile
-    >>> path = tempfile.mkdtemp()
-    >>> model.save(sc, path)
-    >>> sameModel = MatrixFactorizationModel.load(sc, path)
-    >>> sameModel.predict(2, 2)
-    0.4...
-    >>> sameModel.predictAll(testset).collect()
-    [Rating(...
-    >>> from shutil import rmtree
-    >>> try:
-    ...     rmtree(path)
-    ... except OSError:
-    ...     pass
+    10
+    >>> model.userFactors.orderBy("id").collect()
+    [Row(id=0, features=[...]), Row(id=1, ...), Row(id=2, ...)]
+    >>> test = spark.createDataFrame([(0, 2), (1, 0), (2, 0)], ["user", "item"])
+    >>> predictions = sorted(model.transform(test).collect(), key=lambda r: r[0])
+    >>> predictions[0]
+    Row(user=0, item=2, newPrediction=0.69291...)
+    >>> predictions[1]
+    Row(user=1, item=0, newPrediction=3.47356...)
+    >>> predictions[2]
+    Row(user=2, item=0, newPrediction=-0.899198...)
+    >>> user_recs = model.recommendForAllUsers(3)
+    >>> user_recs.where(user_recs.user == 0)\
+        .select("recommendations.item", "recommendations.rating").collect()
+    [Row(item=[0, 1, 2], rating=[3.910..., 1.997..., 0.692...])]
+    >>> item_recs = model.recommendForAllItems(3)
+    >>> item_recs.where(item_recs.item == 2)\
+        .select("recommendations.user", "recommendations.rating").collect()
+    [Row(user=[2, 1, 0], rating=[4.892..., 3.991..., 0.692...])]
+    >>> user_subset = df.where(df.user == 2)
+    >>> user_subset_recs = model.recommendForUserSubset(user_subset, 3)
+    >>> user_subset_recs.select("recommendations.item", "recommendations.rating").first()
+    Row(item=[2, 1, 0], rating=[4.892..., 1.076..., -0.899...])
+    >>> item_subset = df.where(df.item == 0)
+    >>> item_subset_recs = model.recommendForItemSubset(item_subset, 3)
+    >>> item_subset_recs.select("recommendations.user", "recommendations.rating").first()
+    Row(user=[0, 1, 2], rating=[3.910..., 3.473..., -0.899...])
+    >>> als_path = temp_path + "/als"
+    >>> als.save(als_path)
+    >>> als2 = ALS.load(als_path)
+    >>> als.getMaxIter()
+    5
+    >>> model_path = temp_path + "/als_model"
+    >>> model.save(model_path)
+    >>> model2 = ALSModel.load(model_path)
+    >>> model.rank == model2.rank
+    True
+    >>> sorted(model.userFactors.collect()) == sorted(model2.userFactors.collect())
+    True
+    >>> sorted(model.itemFactors.collect()) == sorted(model2.itemFactors.collect())
+    True
+    >>> model.transform(test).take(1) == model2.transform(test).take(1)
+    True
     """
-    @since("0.9.0")
-    def predict(self, user, product):
-        """
-        Predicts rating for the given user and product.
-        """
-        return self._java_model.predict(int(user), int(product))
 
-    @since("0.9.0")
-    def predictAll(self, user_product):
+    @keyword_only
+    def __init__(self, *, rank=10, maxIter=10, regParam=0.1, numUserBlocks=10,
+                 numItemBlocks=10, implicitPrefs=False, alpha=1.0, userCol="user", itemCol="item",
+                 seed=None, ratingCol="rating", nonnegative=False, checkpointInterval=10,
+                 intermediateStorageLevel="MEMORY_AND_DISK",
+                 finalStorageLevel="MEMORY_AND_DISK", coldStartStrategy="nan", blockSize=4096):
         """
-        Returns a list of predicted ratings for input user and product
-        pairs.
+        __init__(self, \\*, rank=10, maxIter=10, regParam=0.1, numUserBlocks=10,
+                 numItemBlocks=10, implicitPrefs=False, alpha=1.0, userCol="user", itemCol="item", \
+                 seed=None, ratingCol="rating", nonnegative=False, checkpointInterval=10, \
+                 intermediateStorageLevel="MEMORY_AND_DISK", \
+                 finalStorageLevel="MEMORY_AND_DISK", coldStartStrategy="nan", blockSize=4096)
         """
-        assert isinstance(user_product, RDD), "user_product should be RDD of (user, product)"
-        first = user_product.first()
-        assert len(first) == 2, "user_product should be RDD of (user, product)"
-        user_product = user_product.map(lambda u_p: (int(u_p[0]), int(u_p[1])))
-        return self.call("predict", user_product)
+        super(ALS, self).__init__()
+        self._java_obj = self._new_java_obj("org.apache.spark.ml.recommendation.ALS", self.uid)
+        kwargs = self._input_kwargs
+        self.setParams(**kwargs)
 
-    @since("1.2.0")
-    def userFeatures(self):
+    @keyword_only
+    @since("1.4.0")
+    def setParams(self, *, rank=10, maxIter=10, regParam=0.1, numUserBlocks=10,
+                  numItemBlocks=10, implicitPrefs=False, alpha=1.0, userCol="user", itemCol="item",
+                  seed=None, ratingCol="rating", nonnegative=False, checkpointInterval=10,
+                  intermediateStorageLevel="MEMORY_AND_DISK",
+                  finalStorageLevel="MEMORY_AND_DISK", coldStartStrategy="nan", blockSize=4096):
         """
-        Returns a paired RDD, where the first element is the user and the
-        second is an array of features corresponding to that user.
+        setParams(self, \\*, rank=10, maxIter=10, regParam=0.1, numUserBlocks=10, \
+                 numItemBlocks=10, implicitPrefs=False, alpha=1.0, userCol="user", itemCol="item", \
+                 seed=None, ratingCol="rating", nonnegative=False, checkpointInterval=10, \
+                 intermediateStorageLevel="MEMORY_AND_DISK", \
+                 finalStorageLevel="MEMORY_AND_DISK", coldStartStrategy="nan", blockSize=4096)
+        Sets params for ALS.
         """
-        return self.call("getUserFeatures").mapValues(lambda v: array.array('d', v))
+        kwargs = self._input_kwargs
+        return self._set(**kwargs)
 
-    @since("1.2.0")
-    def productFeatures(self):
-        """
-        Returns a paired RDD, where the first element is the product and the
-        second is an array of features corresponding to that product.
-        """
-        return self.call("getProductFeatures").mapValues(lambda v: array.array('d', v))
+    def _create_model(self, java_model):
+        return ALSModel(java_model)
 
     @since("1.4.0")
-    def recommendUsers(self, product, num):
+    def setRank(self, value):
         """
-        Recommends the top "num" number of users for a given product and
-        returns a list of Rating objects sorted by the predicted rating in
-        descending order.
+        Sets the value of :py:attr:`rank`.
         """
-        return list(self.call("recommendUsers", product, num))
+        return self._set(rank=value)
 
     @since("1.4.0")
-    def recommendProducts(self, user, num):
+    def setNumUserBlocks(self, value):
         """
-        Recommends the top "num" number of products for a given user and
-        returns a list of Rating objects sorted by the predicted rating in
-        descending order.
+        Sets the value of :py:attr:`numUserBlocks`.
         """
-        return list(self.call("recommendProducts", user, num))
+        return self._set(numUserBlocks=value)
 
-    def recommendProductsForUsers(self, num):
+    @since("1.4.0")
+    def setNumItemBlocks(self, value):
         """
-        Recommends the top "num" number of products for all users. The
-        number of recommendations returned per user may be less than "num".
+        Sets the value of :py:attr:`numItemBlocks`.
         """
-        return self.call("wrappedRecommendProductsForUsers", num)
+        return self._set(numItemBlocks=value)
 
-    def recommendUsersForProducts(self, num):
+    @since("1.4.0")
+    def setNumBlocks(self, value):
         """
-        Recommends the top "num" number of users for all products. The
-        number of recommendations returned per product may be less than
-        "num".
+        Sets both :py:attr:`numUserBlocks` and :py:attr:`numItemBlocks` to the specific value.
         """
-        return self.call("wrappedRecommendUsersForProducts", num)
+        self._set(numUserBlocks=value)
+        return self._set(numItemBlocks=value)
+
+    @since("1.4.0")
+    def setImplicitPrefs(self, value):
+        """
+        Sets the value of :py:attr:`implicitPrefs`.
+        """
+        return self._set(implicitPrefs=value)
+
+    @since("1.4.0")
+    def setAlpha(self, value):
+        """
+        Sets the value of :py:attr:`alpha`.
+        """
+        return self._set(alpha=value)
+
+    @since("1.4.0")
+    def setUserCol(self, value):
+        """
+        Sets the value of :py:attr:`userCol`.
+        """
+        return self._set(userCol=value)
+
+    @since("1.4.0")
+    def setItemCol(self, value):
+        """
+        Sets the value of :py:attr:`itemCol`.
+        """
+        return self._set(itemCol=value)
+
+    @since("1.4.0")
+    def setRatingCol(self, value):
+        """
+        Sets the value of :py:attr:`ratingCol`.
+        """
+        return self._set(ratingCol=value)
+
+    @since("1.4.0")
+    def setNonnegative(self, value):
+        """
+        Sets the value of :py:attr:`nonnegative`.
+        """
+        return self._set(nonnegative=value)
+
+    @since("2.0.0")
+    def setIntermediateStorageLevel(self, value):
+        """
+        Sets the value of :py:attr:`intermediateStorageLevel`.
+        """
+        return self._set(intermediateStorageLevel=value)
+
+    @since("2.0.0")
+    def setFinalStorageLevel(self, value):
+        """
+        Sets the value of :py:attr:`finalStorageLevel`.
+        """
+        return self._set(finalStorageLevel=value)
+
+    @since("2.2.0")
+    def setColdStartStrategy(self, value):
+        """
+        Sets the value of :py:attr:`coldStartStrategy`.
+        """
+        return self._set(coldStartStrategy=value)
+
+    def setMaxIter(self, value):
+        """
+        Sets the value of :py:attr:`maxIter`.
+        """
+        return self._set(maxIter=value)
+
+    def setRegParam(self, value):
+        """
+        Sets the value of :py:attr:`regParam`.
+        """
+        return self._set(regParam=value)
+
+    def setPredictionCol(self, value):
+        """
+        Sets the value of :py:attr:`predictionCol`.
+        """
+        return self._set(predictionCol=value)
+
+    def setCheckpointInterval(self, value):
+        """
+        Sets the value of :py:attr:`checkpointInterval`.
+        """
+        return self._set(checkpointInterval=value)
+
+    def setSeed(self, value):
+        """
+        Sets the value of :py:attr:`seed`.
+        """
+        return self._set(seed=value)
+
+    @since("3.0.0")
+    def setBlockSize(self, value):
+        """
+        Sets the value of :py:attr:`blockSize`.
+        """
+        return self._set(blockSize=value)
+
+
+class ALSModel(JavaModel, _ALSModelParams, JavaMLWritable, JavaMLReadable):
+    """
+    Model fitted by ALS.
+
+    .. versionadded:: 1.4.0
+    """
+
+    @since("3.0.0")
+    def setUserCol(self, value):
+        """
+        Sets the value of :py:attr:`userCol`.
+        """
+        return self._set(userCol=value)
+
+    @since("3.0.0")
+    def setItemCol(self, value):
+        """
+        Sets the value of :py:attr:`itemCol`.
+        """
+        return self._set(itemCol=value)
+
+    @since("3.0.0")
+    def setColdStartStrategy(self, value):
+        """
+        Sets the value of :py:attr:`coldStartStrategy`.
+        """
+        return self._set(coldStartStrategy=value)
+
+    @since("3.0.0")
+    def setPredictionCol(self, value):
+        """
+        Sets the value of :py:attr:`predictionCol`.
+        """
+        return self._set(predictionCol=value)
+
+    @since("3.0.0")
+    def setBlockSize(self, value):
+        """
+        Sets the value of :py:attr:`blockSize`.
+        """
+        return self._set(blockSize=value)
 
     @property
     @since("1.4.0")
     def rank(self):
-        """Rank for the features in this model"""
-        return self.call("rank")
+        """rank of the matrix factorization model"""
+        return self._call_java("rank")
 
-    @classmethod
-    @since("1.3.1")
-    def load(cls, sc, path):
-        """Load a model from the given path"""
-        model = cls._load_java(sc, path)
-        wrapper = sc._jvm.org.apache.spark.mllib.api.python.MatrixFactorizationModelWrapper(model)
-        return MatrixFactorizationModel(wrapper)
-
-
-class ALS(object):
-    """Alternating Least Squares matrix factorization
-
-    .. versionadded:: 0.9.0
-    """
-
-    @classmethod
-    def _prepare(cls, ratings):
-        if isinstance(ratings, RDD):
-            pass
-        elif isinstance(ratings, DataFrame):
-            ratings = ratings.rdd
-        else:
-            raise TypeError("Ratings should be represented by either an RDD or a DataFrame, "
-                            "but got %s." % type(ratings))
-        first = ratings.first()
-        if isinstance(first, Rating):
-            pass
-        elif isinstance(first, (tuple, list)):
-            ratings = ratings.map(lambda x: Rating(*x))
-        else:
-            raise TypeError("Expect a Rating or a tuple/list, but got %s." % type(first))
-        return ratings
-
-    @classmethod
-    def train(cls, ratings, rank, iterations=5, lambda_=0.01, blocks=-1, nonnegative=False,
-              seed=None):
+    @property
+    @since("1.4.0")
+    def userFactors(self):
         """
-        Train a matrix factorization model given an RDD of ratings by users
-        for a subset of products. The ratings matrix is approximated as the
-        product of two lower-rank matrices of a given rank (number of
-        features). To solve for these features, ALS is run iteratively with
-        a configurable level of parallelism.
+        a DataFrame that stores user factors in two columns: `id` and
+        `features`
+        """
+        return self._call_java("userFactors")
 
-        .. versionadded:: 0.9.0
+    @property
+    @since("1.4.0")
+    def itemFactors(self):
+        """
+        a DataFrame that stores item factors in two columns: `id` and
+        `features`
+        """
+        return self._call_java("itemFactors")
+
+    def recommendForAllUsers(self, numItems):
+        """
+        Returns top `numItems` items recommended for each user, for all users.
+
+        .. versionadded:: 2.2.0
 
         Parameters
         ----------
-        ratings : :py:class:`pyspark.RDD`
-            RDD of `Rating` or (userID, productID, rating) tuple.
-        rank : int
-            Number of features to use (also referred to as the number of latent factors).
-        iterations : int, optional
-            Number of iterations of ALS.
-            (default: 5)
-        lambda\\_ : float, optional
-            Regularization parameter.
-            (default: 0.01)
-        blocks : int, optional
-            Number of blocks used to parallelize the computation. A value
-            of -1 will use an auto-configured number of blocks.
-            (default: -1)
-        nonnegative : bool, optional
-            A value of True will solve least-squares with nonnegativity
-            constraints.
-            (default: False)
-        seed : bool, optional
-            Random seed for initial matrix factorization model. A value
-            of None will use system time as the seed.
-            (default: None)
-        """
-        model = callMLlibFunc("trainALSModel", cls._prepare(ratings), rank, iterations,
-                              lambda_, blocks, nonnegative, seed)
-        return MatrixFactorizationModel(model)
+        numItems : int
+            max number of recommendations for each user
 
-    @classmethod
-    def trainImplicit(cls, ratings, rank, iterations=5, lambda_=0.01, blocks=-1, alpha=0.01,
-                      nonnegative=False, seed=None):
+        Returns
+        -------
+        :py:class:`pyspark.sql.DataFrame`
+            a DataFrame of (userCol, recommendations), where recommendations are
+            stored as an array of (itemCol, rating) Rows.
         """
-        Train a matrix factorization model given an RDD of 'implicit
-        preferences' of users for a subset of products. The ratings matrix
-        is approximated as the product of two lower-rank matrices of a
-        given rank (number of features). To solve for these features, ALS
-        is run iteratively with a configurable level of parallelism.
+        return self._call_java("recommendForAllUsers", numItems)
 
-        .. versionadded:: 0.9.0
+    def recommendForAllItems(self, numUsers):
+        """
+        Returns top `numUsers` users recommended for each item, for all items.
+
+        .. versionadded:: 2.2.0
 
         Parameters
         ----------
-        ratings : :py:class:`pyspark.RDD`
-            RDD of `Rating` or (userID, productID, rating) tuple.
-        rank : int
-            Number of features to use (also referred to as the number of latent factors).
-        iterations : int, optional
-            Number of iterations of ALS.
-            (default: 5)
-        lambda\\_ : float, optional
-            Regularization parameter.
-            (default: 0.01)
-        blocks : int, optional
-            Number of blocks used to parallelize the computation. A value
-            of -1 will use an auto-configured number of blocks.
-            (default: -1)
-        alpha : float, optional
-            A constant used in computing confidence.
-            (default: 0.01)
-        nonnegative : bool, optional
-            A value of True will solve least-squares with nonnegativity
-            constraints.
-            (default: False)
-        seed : int, optional
-            Random seed for initial matrix factorization model. A value
-            of None will use system time as the seed.
-            (default: None)
+        numUsers : int
+            max number of recommendations for each item
+
+        Returns
+        -------
+        :py:class:`pyspark.sql.DataFrame`
+            a DataFrame of (itemCol, recommendations), where recommendations are
+            stored as an array of (userCol, rating) Rows.
         """
-        model = callMLlibFunc("trainImplicitALSModel", cls._prepare(ratings), rank,
-                              iterations, lambda_, blocks, alpha, nonnegative, seed)
-        return MatrixFactorizationModel(model)
+        return self._call_java("recommendForAllItems", numUsers)
 
+    def recommendForUserSubset(self, dataset, numItems):
+        """
+        Returns top `numItems` items recommended for each user id in the input data set. Note that
+        if there are duplicate ids in the input dataset, only one set of recommendations per unique
+        id will be returned.
 
-def _test():
-    import doctest
-    import pyspark.mllib.recommendation
-    from pyspark.sql import SQLContext
-    globs = pyspark.mllib.recommendation.__dict__.copy()
-    sc = SparkContext('local[4]', 'PythonTest')
-    globs['sc'] = sc
-    globs['sqlContext'] = SQLContext(sc)
-    (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
-    globs['sc'].stop()
-    if failure_count:
-        sys.exit(-1)
+        .. versionadded:: 2.3.0
+
+        Parameters
+        ----------
+        dataset : :py:class:`pyspark.sql.DataFrame`
+            a DataFrame containing a column of user ids. The column name must match `userCol`.
+        numItems : int
+            max number of recommendations for each user
+
+        Returns
+        -------
+        :py:class:`pyspark.sql.DataFrame`
+            a DataFrame of (userCol, recommendations), where recommendations are
+            stored as an array of (itemCol, rating) Rows.
+        """
+        return self._call_java("recommendForUserSubset", dataset, numItems)
+
+    def recommendForItemSubset(self, dataset, numUsers):
+        """
+        Returns top `numUsers` users recommended for each item id in the input data set. Note that
+        if there are duplicate ids in the input dataset, only one set of recommendations per unique
+        id will be returned.
+
+        .. versionadded:: 2.3.0
+
+        Parameters
+        ----------
+        dataset : :py:class:`pyspark.sql.DataFrame`
+            a DataFrame containing a column of item ids. The column name must match `itemCol`.
+        numUsers : int
+            max number of recommendations for each item
+
+        Returns
+        -------
+        :py:class:`pyspark.sql.DataFrame`
+            a DataFrame of (itemCol, recommendations), where recommendations are
+            stored as an array of (userCol, rating) Rows.
+        """
+        return self._call_java("recommendForItemSubset", dataset, numUsers)
 
 
 if __name__ == "__main__":
-    _test()
+    import doctest
+    import pyspark.ml.recommendation
+    from pyspark.sql import SparkSession
+    globs = pyspark.ml.recommendation.__dict__.copy()
+    # The small batch size here ensures that we see multiple batches,
+    # even in these small test examples:
+    spark = SparkSession.builder\
+        .master("local[2]")\
+        .appName("ml.recommendation tests")\
+        .getOrCreate()
+    sc = spark.sparkContext
+    globs['sc'] = sc
+    globs['spark'] = spark
+    import tempfile
+    temp_path = tempfile.mkdtemp()
+    globs['temp_path'] = temp_path
+    try:
+        (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+        spark.stop()
+    finally:
+        from shutil import rmtree
+        try:
+            rmtree(temp_path)
+        except OSError:
+            pass
+    if failure_count:
+        sys.exit(-1)

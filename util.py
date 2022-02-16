@@ -15,595 +15,653 @@
 # limitations under the License.
 #
 
-import sys
-import numpy as np
+import json
+import os
+import time
+import uuid
 
 from pyspark import SparkContext, since
-from pyspark.mllib.common import callMLlibFunc, inherit_doc
-from pyspark.mllib.linalg import Vectors, SparseVector, _convert_to_vector
-from pyspark.sql import DataFrame
+from pyspark.ml.common import inherit_doc
+from pyspark.sql import SparkSession
+from pyspark.util import VersionUtils
 
 
-class MLUtils(object):
-
+def _jvm():
     """
-    Helper methods to load, save and pre-process data used in MLlib.
-
-    .. versionadded:: 1.0.0
+    Returns the JVM view associated with SparkContext. Must be called
+    after SparkContext is initialized.
     """
-
-    @staticmethod
-    def _parse_libsvm_line(line):
-        """
-        Parses a line in LIBSVM format into (label, indices, values).
-        """
-        items = line.split(None)
-        label = float(items[0])
-        nnz = len(items) - 1
-        indices = np.zeros(nnz, dtype=np.int32)
-        values = np.zeros(nnz)
-        for i in range(nnz):
-            index, value = items[1 + i].split(":")
-            indices[i] = int(index) - 1
-            values[i] = float(value)
-        return label, indices, values
-
-    @staticmethod
-    def _convert_labeled_point_to_libsvm(p):
-        """Converts a LabeledPoint to a string in LIBSVM format."""
-        from pyspark.mllib.regression import LabeledPoint
-        assert isinstance(p, LabeledPoint)
-        items = [str(p.label)]
-        v = _convert_to_vector(p.features)
-        if isinstance(v, SparseVector):
-            nnz = len(v.indices)
-            for i in range(nnz):
-                items.append(str(v.indices[i] + 1) + ":" + str(v.values[i]))
-        else:
-            for i in range(len(v)):
-                items.append(str(i + 1) + ":" + str(v[i]))
-        return " ".join(items)
-
-    @staticmethod
-    def loadLibSVMFile(sc, path, numFeatures=-1, minPartitions=None):
-        """
-        Loads labeled data in the LIBSVM format into an RDD of
-        LabeledPoint. The LIBSVM format is a text-based format used by
-        LIBSVM and LIBLINEAR. Each line represents a labeled sparse
-        feature vector using the following format:
-
-        label index1:value1 index2:value2 ...
-
-        where the indices are one-based and in ascending order. This
-        method parses each line into a LabeledPoint, where the feature
-        indices are converted to zero-based.
-
-        .. versionadded:: 1.0.0
-
-        Parameters
-        ----------
-        sc : :py:class:`pyspark.SparkContext`
-            Spark context
-        path : str
-            file or directory path in any Hadoop-supported file system URI
-        numFeatures : int, optional
-            number of features, which will be determined
-            from the input data if a nonpositive value
-            is given. This is useful when the dataset is
-            already split into multiple files and you
-            want to load them separately, because some
-            features may not present in certain files,
-            which leads to inconsistent feature
-            dimensions.
-        minPartitions : int, optional
-            min number of partitions
-
-        Returns
-        -------
-        :py:class:`pyspark.RDD`
-            labeled data stored as an RDD of LabeledPoint
-
-        Examples
-        --------
-        >>> from tempfile import NamedTemporaryFile
-        >>> from pyspark.mllib.util import MLUtils
-        >>> from pyspark.mllib.regression import LabeledPoint
-        >>> tempFile = NamedTemporaryFile(delete=True)
-        >>> _ = tempFile.write(b"+1 1:1.0 3:2.0 5:3.0\\n-1\\n-1 2:4.0 4:5.0 6:6.0")
-        >>> tempFile.flush()
-        >>> examples = MLUtils.loadLibSVMFile(sc, tempFile.name).collect()
-        >>> tempFile.close()
-        >>> examples[0]
-        LabeledPoint(1.0, (6,[0,2,4],[1.0,2.0,3.0]))
-        >>> examples[1]
-        LabeledPoint(-1.0, (6,[],[]))
-        >>> examples[2]
-        LabeledPoint(-1.0, (6,[1,3,5],[4.0,5.0,6.0]))
-        """
-        from pyspark.mllib.regression import LabeledPoint
-
-        lines = sc.textFile(path, minPartitions)
-        parsed = lines.map(lambda l: MLUtils._parse_libsvm_line(l))
-        if numFeatures <= 0:
-            parsed.cache()
-            numFeatures = parsed.map(lambda x: -1 if x[1].size == 0 else x[1][-1]).reduce(max) + 1
-        return parsed.map(lambda x: LabeledPoint(x[0], Vectors.sparse(numFeatures, x[1], x[2])))
-
-    @staticmethod
-    def saveAsLibSVMFile(data, dir):
-        """
-        Save labeled data in LIBSVM format.
-
-        .. versionadded:: 1.0.0
-
-        Parameters
-        ----------
-        data : :py:class:`pyspark.RDD`
-            an RDD of LabeledPoint to be saved
-        dir : str
-            directory to save the data
-
-        Examples
-        --------
-        >>> from tempfile import NamedTemporaryFile
-        >>> from fileinput import input
-        >>> from pyspark.mllib.regression import LabeledPoint
-        >>> from glob import glob
-        >>> from pyspark.mllib.util import MLUtils
-        >>> examples = [LabeledPoint(1.1, Vectors.sparse(3, [(0, 1.23), (2, 4.56)])),
-        ...             LabeledPoint(0.0, Vectors.dense([1.01, 2.02, 3.03]))]
-        >>> tempFile = NamedTemporaryFile(delete=True)
-        >>> tempFile.close()
-        >>> MLUtils.saveAsLibSVMFile(sc.parallelize(examples), tempFile.name)
-        >>> ''.join(sorted(input(glob(tempFile.name + "/part-0000*"))))
-        '0.0 1:1.01 2:2.02 3:3.03\\n1.1 1:1.23 3:4.56\\n'
-        """
-        lines = data.map(lambda p: MLUtils._convert_labeled_point_to_libsvm(p))
-        lines.saveAsTextFile(dir)
-
-    @staticmethod
-    def loadLabeledPoints(sc, path, minPartitions=None):
-        """
-        Load labeled points saved using RDD.saveAsTextFile.
-
-        .. versionadded:: 1.0.0
-
-        Parameters
-        ----------
-        sc : :py:class:`pyspark.SparkContext`
-            Spark context
-        path : str
-            file or directory path in any Hadoop-supported file system URI
-        minPartitions : int, optional
-            min number of partitions
-
-        Returns
-        -------
-        :py:class:`pyspark.RDD`
-            labeled data stored as an RDD of LabeledPoint
-
-        Examples
-        --------
-        >>> from tempfile import NamedTemporaryFile
-        >>> from pyspark.mllib.util import MLUtils
-        >>> from pyspark.mllib.regression import LabeledPoint
-        >>> examples = [LabeledPoint(1.1, Vectors.sparse(3, [(0, -1.23), (2, 4.56e-7)])),
-        ...             LabeledPoint(0.0, Vectors.dense([1.01, 2.02, 3.03]))]
-        >>> tempFile = NamedTemporaryFile(delete=True)
-        >>> tempFile.close()
-        >>> sc.parallelize(examples, 1).saveAsTextFile(tempFile.name)
-        >>> MLUtils.loadLabeledPoints(sc, tempFile.name).collect()
-        [LabeledPoint(1.1, (3,[0,2],[-1.23,4.56e-07])), LabeledPoint(0.0, [1.01,2.02,3.03])]
-        """
-        minPartitions = minPartitions or min(sc.defaultParallelism, 2)
-        return callMLlibFunc("loadLabeledPoints", sc, path, minPartitions)
-
-    @staticmethod
-    @since("1.5.0")
-    def appendBias(data):
-        """
-        Returns a new vector with `1.0` (bias) appended to
-        the end of the input vector.
-        """
-        vec = _convert_to_vector(data)
-        if isinstance(vec, SparseVector):
-            newIndices = np.append(vec.indices, len(vec))
-            newValues = np.append(vec.values, 1.0)
-            return SparseVector(len(vec) + 1, newIndices, newValues)
-        else:
-            return _convert_to_vector(np.append(vec.toArray(), 1.0))
-
-    @staticmethod
-    @since("1.5.0")
-    def loadVectors(sc, path):
-        """
-        Loads vectors saved using `RDD[Vector].saveAsTextFile`
-        with the default number of partitions.
-        """
-        return callMLlibFunc("loadVectors", sc, path)
-
-    @staticmethod
-    def convertVectorColumnsToML(dataset, *cols):
-        """
-        Converts vector columns in an input DataFrame from the
-        :py:class:`pyspark.mllib.linalg.Vector` type to the new
-        :py:class:`pyspark.ml.linalg.Vector` type under the `spark.ml`
-        package.
-
-        .. versionadded:: 2.0.0
-
-        Parameters
-        ----------
-        dataset : :py:class:`pyspark.sql.DataFrame`
-            input dataset
-        \\*cols : str
-            Vector columns to be converted.
-
-            New vector columns will be ignored. If unspecified, all old
-            vector columns will be converted excepted nested ones.
-
-        Returns
-        -------
-        :py:class:`pyspark.sql.DataFrame`
-            the input dataset with old vector columns converted to the
-            new vector type
-
-        Examples
-        --------
-        >>> import pyspark
-        >>> from pyspark.mllib.linalg import Vectors
-        >>> from pyspark.mllib.util import MLUtils
-        >>> df = spark.createDataFrame(
-        ...     [(0, Vectors.sparse(2, [1], [1.0]), Vectors.dense(2.0, 3.0))],
-        ...     ["id", "x", "y"])
-        >>> r1 = MLUtils.convertVectorColumnsToML(df).first()
-        >>> isinstance(r1.x, pyspark.ml.linalg.SparseVector)
-        True
-        >>> isinstance(r1.y, pyspark.ml.linalg.DenseVector)
-        True
-        >>> r2 = MLUtils.convertVectorColumnsToML(df, "x").first()
-        >>> isinstance(r2.x, pyspark.ml.linalg.SparseVector)
-        True
-        >>> isinstance(r2.y, pyspark.mllib.linalg.DenseVector)
-        True
-        """
-        if not isinstance(dataset, DataFrame):
-            raise TypeError("Input dataset must be a DataFrame but got {}.".format(type(dataset)))
-        return callMLlibFunc("convertVectorColumnsToML", dataset, list(cols))
-
-    @staticmethod
-    def convertVectorColumnsFromML(dataset, *cols):
-        """
-        Converts vector columns in an input DataFrame to the
-        :py:class:`pyspark.mllib.linalg.Vector` type from the new
-        :py:class:`pyspark.ml.linalg.Vector` type under the `spark.ml`
-        package.
-
-        .. versionadded:: 2.0.0
-
-        Parameters
-        ----------
-        dataset : :py:class:`pyspark.sql.DataFrame`
-            input dataset
-        \\*cols : str
-            Vector columns to be converted.
-
-            Old vector columns will be ignored. If unspecified, all new
-            vector columns will be converted except nested ones.
-
-        Returns
-        -------
-        :py:class:`pyspark.sql.DataFrame`
-            the input dataset with new vector columns converted to the
-            old vector type
-
-        Examples
-        --------
-        >>> import pyspark
-        >>> from pyspark.ml.linalg import Vectors
-        >>> from pyspark.mllib.util import MLUtils
-        >>> df = spark.createDataFrame(
-        ...     [(0, Vectors.sparse(2, [1], [1.0]), Vectors.dense(2.0, 3.0))],
-        ...     ["id", "x", "y"])
-        >>> r1 = MLUtils.convertVectorColumnsFromML(df).first()
-        >>> isinstance(r1.x, pyspark.mllib.linalg.SparseVector)
-        True
-        >>> isinstance(r1.y, pyspark.mllib.linalg.DenseVector)
-        True
-        >>> r2 = MLUtils.convertVectorColumnsFromML(df, "x").first()
-        >>> isinstance(r2.x, pyspark.mllib.linalg.SparseVector)
-        True
-        >>> isinstance(r2.y, pyspark.ml.linalg.DenseVector)
-        True
-        """
-        if not isinstance(dataset, DataFrame):
-            raise TypeError("Input dataset must be a DataFrame but got {}.".format(type(dataset)))
-        return callMLlibFunc("convertVectorColumnsFromML", dataset, list(cols))
-
-    @staticmethod
-    def convertMatrixColumnsToML(dataset, *cols):
-        """
-        Converts matrix columns in an input DataFrame from the
-        :py:class:`pyspark.mllib.linalg.Matrix` type to the new
-        :py:class:`pyspark.ml.linalg.Matrix` type under the `spark.ml`
-        package.
-
-        .. versionadded:: 2.0.0
-
-        Parameters
-        ----------
-        dataset : :py:class:`pyspark.sql.DataFrame`
-            input dataset
-        \\*cols : str
-            Matrix columns to be converted.
-
-            New matrix columns will be ignored. If unspecified, all old
-            matrix columns will be converted excepted nested ones.
-
-        Returns
-        -------
-        :py:class:`pyspark.sql.DataFrame`
-            the input dataset with old matrix columns converted to the
-            new matrix type
-
-        Examples
-        --------
-        >>> import pyspark
-        >>> from pyspark.mllib.linalg import Matrices
-        >>> from pyspark.mllib.util import MLUtils
-        >>> df = spark.createDataFrame(
-        ...     [(0, Matrices.sparse(2, 2, [0, 2, 3], [0, 1, 1], [2, 3, 4]),
-        ...     Matrices.dense(2, 2, range(4)))], ["id", "x", "y"])
-        >>> r1 = MLUtils.convertMatrixColumnsToML(df).first()
-        >>> isinstance(r1.x, pyspark.ml.linalg.SparseMatrix)
-        True
-        >>> isinstance(r1.y, pyspark.ml.linalg.DenseMatrix)
-        True
-        >>> r2 = MLUtils.convertMatrixColumnsToML(df, "x").first()
-        >>> isinstance(r2.x, pyspark.ml.linalg.SparseMatrix)
-        True
-        >>> isinstance(r2.y, pyspark.mllib.linalg.DenseMatrix)
-        True
-        """
-        if not isinstance(dataset, DataFrame):
-            raise TypeError("Input dataset must be a DataFrame but got {}.".format(type(dataset)))
-        return callMLlibFunc("convertMatrixColumnsToML", dataset, list(cols))
-
-    @staticmethod
-    def convertMatrixColumnsFromML(dataset, *cols):
-        """
-        Converts matrix columns in an input DataFrame to the
-        :py:class:`pyspark.mllib.linalg.Matrix` type from the new
-        :py:class:`pyspark.ml.linalg.Matrix` type under the `spark.ml`
-        package.
-
-        .. versionadded:: 2.0.0
-
-        Parameters
-        ----------
-        dataset : :py:class:`pyspark.sql.DataFrame`
-            input dataset
-        \\*cols : str
-            Matrix columns to be converted.
-
-            Old matrix columns will be ignored. If unspecified, all new
-            matrix columns will be converted except nested ones.
-
-        Returns
-        -------
-        :py:class:`pyspark.sql.DataFrame`
-            the input dataset with new matrix columns converted to the
-            old matrix type
-
-        Examples
-        --------
-        >>> import pyspark
-        >>> from pyspark.ml.linalg import Matrices
-        >>> from pyspark.mllib.util import MLUtils
-        >>> df = spark.createDataFrame(
-        ...     [(0, Matrices.sparse(2, 2, [0, 2, 3], [0, 1, 1], [2, 3, 4]),
-        ...     Matrices.dense(2, 2, range(4)))], ["id", "x", "y"])
-        >>> r1 = MLUtils.convertMatrixColumnsFromML(df).first()
-        >>> isinstance(r1.x, pyspark.mllib.linalg.SparseMatrix)
-        True
-        >>> isinstance(r1.y, pyspark.mllib.linalg.DenseMatrix)
-        True
-        >>> r2 = MLUtils.convertMatrixColumnsFromML(df, "x").first()
-        >>> isinstance(r2.x, pyspark.mllib.linalg.SparseMatrix)
-        True
-        >>> isinstance(r2.y, pyspark.ml.linalg.DenseMatrix)
-        True
-        """
-        if not isinstance(dataset, DataFrame):
-            raise TypeError("Input dataset must be a DataFrame but got {}.".format(type(dataset)))
-        return callMLlibFunc("convertMatrixColumnsFromML", dataset, list(cols))
+    jvm = SparkContext._jvm
+    if jvm:
+        return jvm
+    else:
+        raise AttributeError("Cannot load _jvm from SparkContext. Is SparkContext initialized?")
 
 
-class Saveable(object):
+class Identifiable(object):
     """
-    Mixin for models and transformers which may be saved as files.
-
-    .. versionadded:: 1.3.0
+    Object with a unique ID.
     """
 
-    def save(self, sc, path):
+    def __init__(self):
+        #: A unique id for the object.
+        self.uid = self._randomUID()
+
+    def __repr__(self):
+        return self.uid
+
+    @classmethod
+    def _randomUID(cls):
         """
-        Save this model to the given path.
-
-        This saves:
-         * human-readable (JSON) model metadata to path/metadata/
-         * Parquet formatted data to path/data/
-
-        The model may be loaded using :py:meth:`Loader.load`.
-
-        Parameters
-        ----------
-        sc : :py:class:`pyspark.SparkContext`
-            Spark context used to save model data.
-        path : str
-            Path specifying the directory in which to save
-            this model. If the directory already exists,
-            this method throws an exception.
+        Generate a unique string id for the object. The default implementation
+        concatenates the class name, "_", and 12 random hex chars.
         """
-        raise NotImplementedError
+        return str(cls.__name__ + "_" + uuid.uuid4().hex[-12:])
 
 
 @inherit_doc
-class JavaSaveable(Saveable):
+class BaseReadWrite(object):
     """
-    Mixin for models that provide save() through their Scala
-    implementation.
+    Base class for MLWriter and MLReader. Stores information about the SparkContext
+    and SparkSession.
 
-    .. versionadded:: 1.3.0
+    .. versionadded:: 2.3.0
     """
 
-    @since("1.3.0")
-    def save(self, sc, path):
-        """Save this model to the given path."""
-        if not isinstance(sc, SparkContext):
-            raise TypeError("sc should be a SparkContext, got type %s" % type(sc))
+    def __init__(self):
+        self._sparkSession = None
+
+    def session(self, sparkSession):
+        """
+        Sets the Spark Session to use for saving/loading.
+        """
+        self._sparkSession = sparkSession
+        return self
+
+    @property
+    def sparkSession(self):
+        """
+        Returns the user-specified Spark Session or the default.
+        """
+        if self._sparkSession is None:
+            self._sparkSession = SparkSession.builder.getOrCreate()
+        return self._sparkSession
+
+    @property
+    def sc(self):
+        """
+        Returns the underlying `SparkContext`.
+        """
+        return self.sparkSession.sparkContext
+
+
+@inherit_doc
+class MLWriter(BaseReadWrite):
+    """
+    Utility class that can save ML instances.
+
+    .. versionadded:: 2.0.0
+    """
+
+    def __init__(self):
+        super(MLWriter, self).__init__()
+        self.shouldOverwrite = False
+        self.optionMap = {}
+
+    def _handleOverwrite(self, path):
+        from pyspark.ml.wrapper import JavaWrapper
+
+        _java_obj = JavaWrapper._new_java_obj("org.apache.spark.ml.util.FileSystemOverwrite")
+        wrapper = JavaWrapper(_java_obj)
+        wrapper._call_java("handleOverwrite", path, True, self.sparkSession._jsparkSession)
+
+    def save(self, path):
+        """Save the ML instance to the input path."""
+        if self.shouldOverwrite:
+            self._handleOverwrite(path)
+        self.saveImpl(path)
+
+    def saveImpl(self, path):
+        """
+        save() handles overwriting and then calls this method.  Subclasses should override this
+        method to implement the actual saving of the instance.
+        """
+        raise NotImplementedError("MLWriter is not yet implemented for type: %s" % type(self))
+
+    def overwrite(self):
+        """Overwrites if the output path already exists."""
+        self.shouldOverwrite = True
+        return self
+
+    def option(self, key, value):
+        """
+        Adds an option to the underlying MLWriter. See the documentation for the specific model's
+        writer for possible options. The option name (key) is case-insensitive.
+        """
+        self.optionMap[key.lower()] = str(value)
+        return self
+
+
+@inherit_doc
+class GeneralMLWriter(MLWriter):
+    """
+    Utility class that can save ML instances in different formats.
+
+    .. versionadded:: 2.4.0
+    """
+
+    def format(self, source):
+        """
+        Specifies the format of ML export ("pmml", "internal", or the fully qualified class
+        name for export).
+        """
+        self.source = source
+        return self
+
+
+@inherit_doc
+class JavaMLWriter(MLWriter):
+    """
+    (Private) Specialization of :py:class:`MLWriter` for :py:class:`JavaParams` types
+    """
+
+    def __init__(self, instance):
+        super(JavaMLWriter, self).__init__()
+        _java_obj = instance._to_java()
+        self._jwrite = _java_obj.write()
+
+    def save(self, path):
+        """Save the ML instance to the input path."""
         if not isinstance(path, str):
             raise TypeError("path should be a string, got type %s" % type(path))
-        self._java_model.save(sc._jsc.sc(), path)
+        self._jwrite.save(path)
 
+    def overwrite(self):
+        """Overwrites if the output path already exists."""
+        self._jwrite.overwrite()
+        return self
 
-class Loader(object):
-    """
-    Mixin for classes which can load saved models from files.
+    def option(self, key, value):
+        self._jwrite.option(key, value)
+        return self
 
-    .. versionadded:: 1.3.0
-    """
-
-    @classmethod
-    def load(cls, sc, path):
-        """
-        Load a model from the given path. The model should have been
-        saved using :py:meth:`Saveable.save`.
-
-        Parameters
-        ----------
-        sc : :py:class:`pyspark.SparkContext`
-            Spark context used for loading model files.
-        path : str
-            Path specifying the directory to which the model was saved.
-
-        Returns
-        -------
-        object
-            model instance
-        """
-        raise NotImplementedError
+    def session(self, sparkSession):
+        """Sets the Spark Session to use for saving."""
+        self._jwrite.session(sparkSession._jsparkSession)
+        return self
 
 
 @inherit_doc
-class JavaLoader(Loader):
+class GeneralJavaMLWriter(JavaMLWriter):
     """
-    Mixin for classes which can load saved models using its Scala
-    implementation.
+    (Private) Specialization of :py:class:`GeneralMLWriter` for :py:class:`JavaParams` types
+    """
 
-    .. versionadded:: 1.3.0
+    def __init__(self, instance):
+        super(GeneralJavaMLWriter, self).__init__(instance)
+
+    def format(self, source):
+        """
+        Specifies the format of ML export ("pmml", "internal", or the fully qualified class
+        name for export).
+        """
+        self._jwrite.format(source)
+        return self
+
+
+@inherit_doc
+class MLWritable(object):
     """
+    Mixin for ML instances that provide :py:class:`MLWriter`.
+
+    .. versionadded:: 2.0.0
+    """
+
+    def write(self):
+        """Returns an MLWriter instance for this ML instance."""
+        raise NotImplementedError("MLWritable is not yet implemented for type: %r" % type(self))
+
+    def save(self, path):
+        """Save this ML instance to the given path, a shortcut of 'write().save(path)'."""
+        self.write().save(path)
+
+
+@inherit_doc
+class JavaMLWritable(MLWritable):
+    """
+    (Private) Mixin for ML instances that provide :py:class:`JavaMLWriter`.
+    """
+
+    def write(self):
+        """Returns an MLWriter instance for this ML instance."""
+        return JavaMLWriter(self)
+
+
+@inherit_doc
+class GeneralJavaMLWritable(JavaMLWritable):
+    """
+    (Private) Mixin for ML instances that provide :py:class:`GeneralJavaMLWriter`.
+    """
+
+    def write(self):
+        """Returns an GeneralMLWriter instance for this ML instance."""
+        return GeneralJavaMLWriter(self)
+
+
+@inherit_doc
+class MLReader(BaseReadWrite):
+    """
+    Utility class that can load ML instances.
+
+    .. versionadded:: 2.0.0
+    """
+
+    def __init__(self):
+        super(MLReader, self).__init__()
+
+    def load(self, path):
+        """Load the ML instance from the input path."""
+        raise NotImplementedError("MLReader is not yet implemented for type: %s" % type(self))
+
+
+@inherit_doc
+class JavaMLReader(MLReader):
+    """
+    (Private) Specialization of :py:class:`MLReader` for :py:class:`JavaParams` types
+    """
+
+    def __init__(self, clazz):
+        super(JavaMLReader, self).__init__()
+        self._clazz = clazz
+        self._jread = self._load_java_obj(clazz).read()
+
+    def load(self, path):
+        """Load the ML instance from the input path."""
+        if not isinstance(path, str):
+            raise TypeError("path should be a string, got type %s" % type(path))
+        java_obj = self._jread.load(path)
+        if not hasattr(self._clazz, "_from_java"):
+            raise NotImplementedError("This Java ML type cannot be loaded into Python currently: %r"
+                                      % self._clazz)
+        return self._clazz._from_java(java_obj)
+
+    def session(self, sparkSession):
+        """Sets the Spark Session to use for loading."""
+        self._jread.session(sparkSession._jsparkSession)
+        return self
 
     @classmethod
-    def _java_loader_class(cls):
+    def _java_loader_class(cls, clazz):
         """
-        Returns the full class name of the Java loader. The default
+        Returns the full class name of the Java ML instance. The default
         implementation replaces "pyspark" by "org.apache.spark" in
         the Python full class name.
         """
-        java_package = cls.__module__.replace("pyspark", "org.apache.spark")
-        return ".".join([java_package, cls.__name__])
+        java_package = clazz.__module__.replace("pyspark", "org.apache.spark")
+        if clazz.__name__ in ("Pipeline", "PipelineModel"):
+            # Remove the last package name "pipeline" for Pipeline and PipelineModel.
+            java_package = ".".join(java_package.split(".")[0:-1])
+        return java_package + "." + clazz.__name__
 
     @classmethod
-    def _load_java(cls, sc, path):
-        """
-        Load a Java model from the given path.
-        """
-        java_class = cls._java_loader_class()
-        java_obj = sc._jvm
+    def _load_java_obj(cls, clazz):
+        """Load the peer Java object of the ML instance."""
+        java_class = cls._java_loader_class(clazz)
+        java_obj = _jvm()
         for name in java_class.split("."):
             java_obj = getattr(java_obj, name)
-        return java_obj.load(sc._jsc.sc(), path)
-
-    @classmethod
-    @since("1.3.0")
-    def load(cls, sc, path):
-        """Load a model from the given path."""
-        java_model = cls._load_java(sc, path)
-        return cls(java_model)
+        return java_obj
 
 
-class LinearDataGenerator(object):
-    """Utils for generating linear data.
+@inherit_doc
+class MLReadable(object):
+    """
+    Mixin for instances that provide :py:class:`MLReader`.
 
-    .. versionadded:: 1.5.0
+    .. versionadded:: 2.0.0
     """
 
+    @classmethod
+    def read(cls):
+        """Returns an MLReader instance for this class."""
+        raise NotImplementedError("MLReadable.read() not implemented for type: %r" % cls)
+
+    @classmethod
+    def load(cls, path):
+        """Reads an ML instance from the input path, a shortcut of `read().load(path)`."""
+        return cls.read().load(path)
+
+
+@inherit_doc
+class JavaMLReadable(MLReadable):
+    """
+    (Private) Mixin for instances that provide JavaMLReader.
+    """
+
+    @classmethod
+    def read(cls):
+        """Returns an MLReader instance for this class."""
+        return JavaMLReader(cls)
+
+
+@inherit_doc
+class DefaultParamsWritable(MLWritable):
+    """
+    Helper trait for making simple :py:class:`Params` types writable.  If a :py:class:`Params`
+    class stores all data as :py:class:`Param` values, then extending this trait will provide
+    a default implementation of writing saved instances of the class.
+    This only handles simple :py:class:`Param` types; e.g., it will not handle
+    :py:class:`pyspark.sql.DataFrame`. See :py:class:`DefaultParamsReadable`, the counterpart
+    to this class.
+
+    .. versionadded:: 2.3.0
+    """
+
+    def write(self):
+        """Returns a DefaultParamsWriter instance for this class."""
+        from pyspark.ml.param import Params
+
+        if isinstance(self, Params):
+            return DefaultParamsWriter(self)
+        else:
+            raise TypeError("Cannot use DefautParamsWritable with type %s because it does not " +
+                            " extend Params.", type(self))
+
+
+@inherit_doc
+class DefaultParamsWriter(MLWriter):
+    """
+    Specialization of :py:class:`MLWriter` for :py:class:`Params` types
+
+    Class for writing Estimators and Transformers whose parameters are JSON-serializable.
+
+    .. versionadded:: 2.3.0
+    """
+
+    def __init__(self, instance):
+        super(DefaultParamsWriter, self).__init__()
+        self.instance = instance
+
+    def saveImpl(self, path):
+        DefaultParamsWriter.saveMetadata(self.instance, path, self.sc)
+
     @staticmethod
-    def generateLinearInput(intercept, weights, xMean, xVariance,
-                            nPoints, seed, eps):
+    def extractJsonParams(instance, skipParams):
+        paramMap = instance.extractParamMap()
+        jsonParams = {param.name: value for param, value in paramMap.items()
+                      if param.name not in skipParams}
+        return jsonParams
+
+    @staticmethod
+    def saveMetadata(instance, path, sc, extraMetadata=None, paramMap=None):
         """
-        .. versionadded:: 1.5.0
+        Saves metadata + Params to: path + "/metadata"
+
+        - class
+        - timestamp
+        - sparkVersion
+        - uid
+        - paramMap
+        - defaultParamMap (since 2.4.0)
+        - (optionally, extra metadata)
 
         Parameters
         ----------
-        intercept : float
-            bias factor, the term c in X'w + c
-        weights : :py:class:`pyspark.mllib.linalg.Vector` or convertible
-            feature vector, the term w in X'w + c
-        xMean : :py:class:`pyspark.mllib.linalg.Vector` or convertible
-            Point around which the data X is centered.
-        xVariance : :py:class:`pyspark.mllib.linalg.Vector` or convertible
-            Variance of the given data
-        nPoints : int
-            Number of points to be generated
-        seed : int
-            Random Seed
-        eps : float
-            Used to scale the noise. If eps is set high,
-            the amount of gaussian noise added is more.
-
-        Returns
-        -------
-        list
-            of :py:class:`pyspark.mllib.regression.LabeledPoints` of length nPoints
+        extraMetadata : dict, optional
+            Extra metadata to be saved at same level as uid, paramMap, etc.
+        paramMap : dict, optional
+            If given, this is saved in the "paramMap" field.
         """
-        weights = [float(weight) for weight in weights]
-        xMean = [float(mean) for mean in xMean]
-        xVariance = [float(var) for var in xVariance]
-        return list(callMLlibFunc(
-            "generateLinearInputWrapper", float(intercept), weights, xMean,
-            xVariance, int(nPoints), int(seed), float(eps)))
+        metadataPath = os.path.join(path, "metadata")
+        metadataJson = DefaultParamsWriter._get_metadata_to_save(instance,
+                                                                 sc,
+                                                                 extraMetadata,
+                                                                 paramMap)
+        sc.parallelize([metadataJson], 1).saveAsTextFile(metadataPath)
 
     @staticmethod
-    @since("1.5.0")
-    def generateLinearRDD(sc, nexamples, nfeatures, eps,
-                          nParts=2, intercept=0.0):
+    def _get_metadata_to_save(instance, sc, extraMetadata=None, paramMap=None):
         """
-        Generate an RDD of LabeledPoints.
+        Helper for :py:meth:`DefaultParamsWriter.saveMetadata` which extracts the JSON to save.
+        This is useful for ensemble models which need to save metadata for many sub-models.
+
+        Notes
+        -----
+        See :py:meth:`DefaultParamsWriter.saveMetadata` for details on what this includes.
         """
-        return callMLlibFunc(
-            "generateLinearRDDWrapper", sc, int(nexamples), int(nfeatures),
-            float(eps), int(nParts), float(intercept))
+        uid = instance.uid
+        cls = instance.__module__ + '.' + instance.__class__.__name__
+
+        # User-supplied param values
+        params = instance._paramMap
+        jsonParams = {}
+        if paramMap is not None:
+            jsonParams = paramMap
+        else:
+            for p in params:
+                jsonParams[p.name] = params[p]
+
+        # Default param values
+        jsonDefaultParams = {}
+        for p in instance._defaultParamMap:
+            jsonDefaultParams[p.name] = instance._defaultParamMap[p]
+
+        basicMetadata = {"class": cls, "timestamp": int(round(time.time() * 1000)),
+                         "sparkVersion": sc.version, "uid": uid, "paramMap": jsonParams,
+                         "defaultParamMap": jsonDefaultParams}
+        if extraMetadata is not None:
+            basicMetadata.update(extraMetadata)
+        return json.dumps(basicMetadata, separators=[',',  ':'])
 
 
-def _test():
-    import doctest
-    from pyspark.sql import SparkSession
-    globs = globals().copy()
-    # The small batch size here ensures that we see multiple batches,
-    # even in these small test examples:
-    spark = SparkSession.builder\
-        .master("local[2]")\
-        .appName("mllib.util tests")\
-        .getOrCreate()
-    globs['spark'] = spark
-    globs['sc'] = spark.sparkContext
-    (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
-    spark.stop()
-    if failure_count:
-        sys.exit(-1)
+@inherit_doc
+class DefaultParamsReadable(MLReadable):
+    """
+    Helper trait for making simple :py:class:`Params` types readable.
+    If a :py:class:`Params` class stores all data as :py:class:`Param` values,
+    then extending this trait will provide a default implementation of reading saved
+    instances of the class. This only handles simple :py:class:`Param` types;
+    e.g., it will not handle :py:class:`pyspark.sql.DataFrame`. See
+    :py:class:`DefaultParamsWritable`, the counterpart to this class.
+
+    .. versionadded:: 2.3.0
+    """
+
+    @classmethod
+    def read(cls):
+        """Returns a DefaultParamsReader instance for this class."""
+        return DefaultParamsReader(cls)
 
 
-if __name__ == "__main__":
-    _test()
+@inherit_doc
+class DefaultParamsReader(MLReader):
+    """
+    Specialization of :py:class:`MLReader` for :py:class:`Params` types
+
+    Default :py:class:`MLReader` implementation for transformers and estimators that
+    contain basic (json-serializable) params and no data. This will not handle
+    more complex params or types with data (e.g., models with coefficients).
+
+    .. versionadded:: 2.3.0
+    """
+
+    def __init__(self, cls):
+        super(DefaultParamsReader, self).__init__()
+        self.cls = cls
+
+    @staticmethod
+    def __get_class(clazz):
+        """
+        Loads Python class from its name.
+        """
+        parts = clazz.split('.')
+        module = ".".join(parts[:-1])
+        m = __import__(module)
+        for comp in parts[1:]:
+            m = getattr(m, comp)
+        return m
+
+    def load(self, path):
+        metadata = DefaultParamsReader.loadMetadata(path, self.sc)
+        py_type = DefaultParamsReader.__get_class(metadata['class'])
+        instance = py_type()
+        instance._resetUid(metadata['uid'])
+        DefaultParamsReader.getAndSetParams(instance, metadata)
+        return instance
+
+    @staticmethod
+    def loadMetadata(path, sc, expectedClassName=""):
+        """
+        Load metadata saved using :py:meth:`DefaultParamsWriter.saveMetadata`
+
+        Parameters
+        ----------
+        path : str
+        sc : :py:class:`pyspark.SparkContext`
+        expectedClassName : str, optional
+            If non empty, this is checked against the loaded metadata.
+        """
+        metadataPath = os.path.join(path, "metadata")
+        metadataStr = sc.textFile(metadataPath, 1).first()
+        loadedVals = DefaultParamsReader._parseMetaData(metadataStr, expectedClassName)
+        return loadedVals
+
+    @staticmethod
+    def _parseMetaData(metadataStr, expectedClassName=""):
+        """
+        Parse metadata JSON string produced by :py:meth`DefaultParamsWriter._get_metadata_to_save`.
+        This is a helper function for :py:meth:`DefaultParamsReader.loadMetadata`.
+
+        Parameters
+        ----------
+        metadataStr : str
+            JSON string of metadata
+        expectedClassName : str, optional
+            If non empty, this is checked against the loaded metadata.
+        """
+        metadata = json.loads(metadataStr)
+        className = metadata['class']
+        if len(expectedClassName) > 0:
+            assert className == expectedClassName, "Error loading metadata: Expected " + \
+                "class name {} but found class name {}".format(expectedClassName, className)
+        return metadata
+
+    @staticmethod
+    def getAndSetParams(instance, metadata, skipParams=None):
+        """
+        Extract Params from metadata, and set them in the instance.
+        """
+        # Set user-supplied param values
+        for paramName in metadata['paramMap']:
+            param = instance.getParam(paramName)
+            if skipParams is None or paramName not in skipParams:
+                paramValue = metadata['paramMap'][paramName]
+                instance.set(param, paramValue)
+
+        # Set default param values
+        majorAndMinorVersions = VersionUtils.majorMinorVersion(metadata['sparkVersion'])
+        major = majorAndMinorVersions[0]
+        minor = majorAndMinorVersions[1]
+
+        # For metadata file prior to Spark 2.4, there is no default section.
+        if major > 2 or (major == 2 and minor >= 4):
+            assert 'defaultParamMap' in metadata, "Error loading metadata: Expected " + \
+                "`defaultParamMap` section not found"
+
+            for paramName in metadata['defaultParamMap']:
+                paramValue = metadata['defaultParamMap'][paramName]
+                instance._setDefault(**{paramName: paramValue})
+
+    @staticmethod
+    def isPythonParamsInstance(metadata):
+        return metadata['class'].startswith('pyspark.ml.')
+
+    @staticmethod
+    def loadParamsInstance(path, sc):
+        """
+        Load a :py:class:`Params` instance from the given path, and return it.
+        This assumes the instance inherits from :py:class:`MLReadable`.
+        """
+        metadata = DefaultParamsReader.loadMetadata(path, sc)
+        if DefaultParamsReader.isPythonParamsInstance(metadata):
+            pythonClassName = metadata['class']
+        else:
+            pythonClassName = metadata['class'].replace("org.apache.spark", "pyspark")
+        py_type = DefaultParamsReader.__get_class(pythonClassName)
+        instance = py_type.load(path)
+        return instance
+
+
+@inherit_doc
+class HasTrainingSummary(object):
+    """
+    Base class for models that provides Training summary.
+
+    .. versionadded:: 3.0.0
+    """
+
+    @property
+    @since("2.1.0")
+    def hasSummary(self):
+        """
+        Indicates whether a training summary exists for this model
+        instance.
+        """
+        return self._call_java("hasSummary")
+
+    @property
+    @since("2.1.0")
+    def summary(self):
+        """
+        Gets summary of the model trained on the training set. An exception is thrown if
+        no summary exists.
+        """
+        return (self._call_java("summary"))
+
+
+class MetaAlgorithmReadWrite:
+
+    @staticmethod
+    def isMetaEstimator(pyInstance):
+        from pyspark.ml import Estimator, Pipeline
+        from pyspark.ml.tuning import _ValidatorParams
+        from pyspark.ml.classification import OneVsRest
+        return isinstance(pyInstance, Pipeline) or isinstance(pyInstance, OneVsRest) or \
+            (isinstance(pyInstance, Estimator) and isinstance(pyInstance, _ValidatorParams))
+
+    @staticmethod
+    def getAllNestedStages(pyInstance):
+        from pyspark.ml import Pipeline, PipelineModel
+        from pyspark.ml.tuning import _ValidatorParams
+        from pyspark.ml.classification import OneVsRest, OneVsRestModel
+
+        # TODO: We need to handle `RFormulaModel.pipelineModel` here after Pyspark RFormulaModel
+        #  support pipelineModel property.
+        if isinstance(pyInstance, Pipeline):
+            pySubStages = pyInstance.getStages()
+        elif isinstance(pyInstance, PipelineModel):
+            pySubStages = pyInstance.stages
+        elif isinstance(pyInstance, _ValidatorParams):
+            raise ValueError('PySpark does not support nested validator.')
+        elif isinstance(pyInstance, OneVsRest):
+            pySubStages = [pyInstance.getClassifier()]
+        elif isinstance(pyInstance, OneVsRestModel):
+            pySubStages = [pyInstance.getClassifier()] + pyInstance.models
+        else:
+            pySubStages = []
+
+        nestedStages = []
+        for pySubStage in pySubStages:
+            nestedStages.extend(MetaAlgorithmReadWrite.getAllNestedStages(pySubStage))
+
+        return [pyInstance] + nestedStages
+
+    @staticmethod
+    def getUidMap(instance):
+        nestedStages = MetaAlgorithmReadWrite.getAllNestedStages(instance)
+        uidMap = {stage.uid: stage for stage in nestedStages}
+        if len(nestedStages) != len(uidMap):
+            raise RuntimeError(f'{instance.__class__.__module__}.{instance.__class__.__name__}'
+                               f'.load found a compound estimator with stages with duplicate '
+                               f'UIDs. List of UIDs: {list(uidMap.keys())}.')
+        return uidMap

@@ -16,111 +16,97 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from typing import overload
-from typing import Dict, Optional, Tuple
-from pyspark.mllib._typing import VectorLike
-from pyspark.rdd import RDD
-from pyspark.mllib.common import JavaModelWrapper
-from pyspark.mllib.regression import LabeledPoint
-from pyspark.mllib.util import JavaLoader, JavaSaveable
+from typing import List, Sequence
+from pyspark.ml._typing import P, T
 
-class TreeEnsembleModel(JavaModelWrapper, JavaSaveable):
-    @overload
-    def predict(self, x: VectorLike) -> float: ...
-    @overload
-    def predict(self, x: RDD[VectorLike]) -> RDD[VectorLike]: ...
-    def numTrees(self) -> int: ...
-    def totalNumNodes(self) -> int: ...
-    def toDebugString(self) -> str: ...
+from pyspark.ml.linalg import Vector
+from pyspark import since as since  # noqa: F401
+from pyspark.ml.common import inherit_doc as inherit_doc  # noqa: F401
+from pyspark.ml.param import Param, Params as Params
+from pyspark.ml.param.shared import (  # noqa: F401
+    HasCheckpointInterval as HasCheckpointInterval,
+    HasMaxIter as HasMaxIter,
+    HasSeed as HasSeed,
+    HasStepSize as HasStepSize,
+    HasValidationIndicatorCol as HasValidationIndicatorCol,
+    HasWeightCol as HasWeightCol,
+    Param as Param,
+    TypeConverters as TypeConverters,
+)
+from pyspark.ml.wrapper import JavaPredictionModel as JavaPredictionModel
 
-class DecisionTreeModel(JavaModelWrapper, JavaSaveable, JavaLoader[DecisionTreeModel]):
-    @overload
-    def predict(self, x: VectorLike) -> float: ...
-    @overload
-    def predict(self, x: RDD[VectorLike]) -> RDD[VectorLike]: ...
+class _DecisionTreeModel(JavaPredictionModel[T]):
+    @property
     def numNodes(self) -> int: ...
+    @property
     def depth(self) -> int: ...
+    @property
+    def toDebugString(self) -> str: ...
+    def predictLeaf(self, value: Vector) -> float: ...
+
+class _DecisionTreeParams(HasCheckpointInterval, HasSeed, HasWeightCol):
+    leafCol: Param[str]
+    maxDepth: Param[int]
+    maxBins: Param[int]
+    minInstancesPerNode: Param[int]
+    minWeightFractionPerNode: Param[float]
+    minInfoGain: Param[float]
+    maxMemoryInMB: Param[int]
+    cacheNodeIds: Param[bool]
+    def __init__(self) -> None: ...
+    def setLeafCol(self: P, value: str) -> P: ...
+    def getLeafCol(self) -> str: ...
+    def getMaxDepth(self) -> int: ...
+    def getMaxBins(self) -> int: ...
+    def getMinInstancesPerNode(self) -> int: ...
+    def getMinInfoGain(self) -> float: ...
+    def getMaxMemoryInMB(self) -> int: ...
+    def getCacheNodeIds(self) -> bool: ...
+
+class _TreeEnsembleModel(JavaPredictionModel[T]):
+    @property
+    def trees(self) -> Sequence[_DecisionTreeModel]: ...
+    @property
+    def getNumTrees(self) -> int: ...
+    @property
+    def treeWeights(self) -> List[float]: ...
+    @property
+    def totalNumNodes(self) -> int: ...
+    @property
     def toDebugString(self) -> str: ...
 
-class DecisionTree:
-    @classmethod
-    def trainClassifier(
-        cls,
-        data: RDD[LabeledPoint],
-        numClasses: int,
-        categoricalFeaturesInfo: Dict[int, int],
-        impurity: str = ...,
-        maxDepth: int = ...,
-        maxBins: int = ...,
-        minInstancesPerNode: int = ...,
-        minInfoGain: float = ...,
-    ) -> DecisionTreeModel: ...
-    @classmethod
-    def trainRegressor(
-        cls,
-        data: RDD[LabeledPoint],
-        categoricalFeaturesInfo: Dict[int, int],
-        impurity: str = ...,
-        maxDepth: int = ...,
-        maxBins: int = ...,
-        minInstancesPerNode: int = ...,
-        minInfoGain: float = ...,
-    ) -> DecisionTreeModel: ...
+class _TreeEnsembleParams(_DecisionTreeParams):
+    subsamplingRate: Param[float]
+    supportedFeatureSubsetStrategies: List[str]
+    featureSubsetStrategy: Param[str]
+    def __init__(self) -> None: ...
+    def getSubsamplingRate(self) -> float: ...
+    def getFeatureSubsetStrategy(self) -> str: ...
 
-class RandomForestModel(TreeEnsembleModel, JavaLoader[RandomForestModel]): ...
+class _RandomForestParams(_TreeEnsembleParams):
+    numTrees: Param[int]
+    bootstrap: Param[bool]
+    def __init__(self) -> None: ...
+    def getNumTrees(self) -> int: ...
+    def getBootstrap(self) -> bool: ...
 
-class RandomForest:
-    supportedFeatureSubsetStrategies: Tuple[str, ...]
-    @classmethod
-    def trainClassifier(
-        cls,
-        data: RDD[LabeledPoint],
-        numClasses: int,
-        categoricalFeaturesInfo: Dict[int, int],
-        numTrees: int,
-        featureSubsetStrategy: str = ...,
-        impurity: str = ...,
-        maxDepth: int = ...,
-        maxBins: int = ...,
-        seed: Optional[int] = ...,
-    ) -> RandomForestModel: ...
-    @classmethod
-    def trainRegressor(
-        cls,
-        data: RDD[LabeledPoint],
-        categoricalFeaturesInfo: Dict[int, int],
-        numTrees: int,
-        featureSubsetStrategy: str = ...,
-        impurity: str = ...,
-        maxDepth: int = ...,
-        maxBins: int = ...,
-        seed: Optional[int] = ...,
-    ) -> RandomForestModel: ...
+class _GBTParams(
+    _TreeEnsembleParams, HasMaxIter, HasStepSize, HasValidationIndicatorCol
+):
+    stepSize: Param[float]
+    validationTol: Param[float]
+    def getValidationTol(self) -> float: ...
 
-class GradientBoostedTreesModel(
-    TreeEnsembleModel, JavaLoader[GradientBoostedTreesModel]
-): ...
+class _HasVarianceImpurity(Params):
+    supportedImpurities: List[str]
+    impurity: Param[str]
+    def __init__(self) -> None: ...
+    def getImpurity(self) -> str: ...
 
-class GradientBoostedTrees:
-    @classmethod
-    def trainClassifier(
-        cls,
-        data: RDD[LabeledPoint],
-        categoricalFeaturesInfo: Dict[int, int],
-        loss: str = ...,
-        numIterations: int = ...,
-        learningRate: float = ...,
-        maxDepth: int = ...,
-        maxBins: int = ...,
-    ) -> GradientBoostedTreesModel: ...
-    @classmethod
-    def trainRegressor(
-        cls,
-        data: RDD[LabeledPoint],
-        categoricalFeaturesInfo: Dict[int, int],
-        loss: str = ...,
-        numIterations: int = ...,
-        learningRate: float = ...,
-        maxDepth: int = ...,
-        maxBins: int = ...,
-    ) -> GradientBoostedTreesModel: ...
+class _TreeClassifierParams(Params):
+    supportedImpurities: List[str]
+    impurity: Param[str]
+    def __init__(self) -> None: ...
+    def getImpurity(self) -> str: ...
+
+class _TreeRegressorParams(_HasVarianceImpurity): ...

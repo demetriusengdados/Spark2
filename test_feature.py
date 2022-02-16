@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -15,174 +16,292 @@
 # limitations under the License.
 #
 
-from math import sqrt
 import unittest
 
-from numpy import array, abs, tile
-
-from pyspark.mllib.linalg import SparseVector, DenseVector, Vectors
-from pyspark.mllib.linalg.distributed import RowMatrix
-from pyspark.mllib.feature import HashingTF, IDF, StandardScaler, ElementwiseProduct, Word2Vec
-from pyspark.testing.mllibutils import MLlibTestCase
-
-
-class FeatureTest(MLlibTestCase):
-    def test_idf_model(self):
-        data = [
-            Vectors.dense([1, 2, 6, 0, 2, 3, 1, 1, 0, 0, 3]),
-            Vectors.dense([1, 3, 0, 1, 3, 0, 0, 2, 0, 0, 1]),
-            Vectors.dense([1, 4, 1, 0, 0, 4, 9, 0, 1, 2, 0]),
-            Vectors.dense([2, 1, 0, 3, 0, 0, 5, 0, 2, 3, 9])
-        ]
-        model = IDF().fit(self.sc.parallelize(data, 2))
-        idf = model.idf()
-        self.assertEqual(len(idf), 11)
+from pyspark.ml.feature import Binarizer, CountVectorizer, CountVectorizerModel, HashingTF, IDF, \
+    NGram, RFormula, StopWordsRemover, StringIndexer, StringIndexerModel, VectorSizeHint
+from pyspark.ml.linalg import DenseVector, SparseVector, Vectors
+from pyspark.sql import Row
+from pyspark.testing.utils import QuietTest
+from pyspark.testing.mlutils import check_params, SparkSessionTestCase
 
 
-class Word2VecTests(MLlibTestCase):
-    def test_word2vec_setters(self):
-        model = Word2Vec() \
-            .setVectorSize(2) \
-            .setLearningRate(0.01) \
-            .setNumPartitions(2) \
-            .setNumIterations(10) \
-            .setSeed(1024) \
-            .setMinCount(3) \
-            .setWindowSize(6)
-        self.assertEqual(model.vectorSize, 2)
-        self.assertTrue(model.learningRate < 0.02)
-        self.assertEqual(model.numPartitions, 2)
-        self.assertEqual(model.numIterations, 10)
-        self.assertEqual(model.seed, 1024)
-        self.assertEqual(model.minCount, 3)
-        self.assertEqual(model.windowSize, 6)
+class FeatureTests(SparkSessionTestCase):
 
-    def test_word2vec_get_vectors(self):
-        data = [
-            ["a", "b", "c", "d", "e", "f", "g"],
-            ["a", "b", "c", "d", "e", "f"],
-            ["a", "b", "c", "d", "e"],
-            ["a", "b", "c", "d"],
-            ["a", "b", "c"],
-            ["a", "b"],
-            ["a"]
-        ]
-        model = Word2Vec().fit(self.sc.parallelize(data))
-        self.assertEqual(len(model.getVectors()), 3)
+    def test_binarizer(self):
+        b0 = Binarizer()
+        self.assertListEqual(b0.params, [b0.inputCol, b0.inputCols, b0.outputCol,
+                                         b0.outputCols, b0.threshold, b0.thresholds])
+        self.assertTrue(all([~b0.isSet(p) for p in b0.params]))
+        self.assertTrue(b0.hasDefault(b0.threshold))
+        self.assertEqual(b0.getThreshold(), 0.0)
+        b0.setParams(inputCol="input", outputCol="output").setThreshold(1.0)
+        self.assertTrue(not all([b0.isSet(p) for p in b0.params]))
+        self.assertEqual(b0.getThreshold(), 1.0)
+        self.assertEqual(b0.getInputCol(), "input")
+        self.assertEqual(b0.getOutputCol(), "output")
+
+        b0c = b0.copy({b0.threshold: 2.0})
+        self.assertEqual(b0c.uid, b0.uid)
+        self.assertListEqual(b0c.params, b0.params)
+        self.assertEqual(b0c.getThreshold(), 2.0)
+
+        b1 = Binarizer(threshold=2.0, inputCol="input", outputCol="output")
+        self.assertNotEqual(b1.uid, b0.uid)
+        self.assertEqual(b1.getThreshold(), 2.0)
+        self.assertEqual(b1.getInputCol(), "input")
+        self.assertEqual(b1.getOutputCol(), "output")
+
+    def test_idf(self):
+        dataset = self.spark.createDataFrame([
+            (DenseVector([1.0, 2.0]),),
+            (DenseVector([0.0, 1.0]),),
+            (DenseVector([3.0, 0.2]),)], ["tf"])
+        idf0 = IDF(inputCol="tf")
+        self.assertListEqual(idf0.params, [idf0.inputCol, idf0.minDocFreq, idf0.outputCol])
+        idf0m = idf0.fit(dataset, {idf0.outputCol: "idf"})
+        self.assertEqual(idf0m.uid, idf0.uid,
+                         "Model should inherit the UID from its parent estimator.")
+        output = idf0m.transform(dataset)
+        self.assertIsNotNone(output.head().idf)
+        self.assertIsNotNone(idf0m.docFreq)
+        self.assertEqual(idf0m.numDocs, 3)
+        # Test that parameters transferred to Python Model
+        check_params(self, idf0m)
+
+    def test_ngram(self):
+        dataset = self.spark.createDataFrame([
+            Row(input=["a", "b", "c", "d", "e"])])
+        ngram0 = NGram(n=4, inputCol="input", outputCol="output")
+        self.assertEqual(ngram0.getN(), 4)
+        self.assertEqual(ngram0.getInputCol(), "input")
+        self.assertEqual(ngram0.getOutputCol(), "output")
+        transformedDF = ngram0.transform(dataset)
+        self.assertEqual(transformedDF.head().output, ["a b c d", "b c d e"])
+
+    def test_stopwordsremover(self):
+        dataset = self.spark.createDataFrame([Row(input=["a", "panda"])])
+        stopWordRemover = StopWordsRemover(inputCol="input", outputCol="output")
+        # Default
+        self.assertEqual(stopWordRemover.getInputCol(), "input")
+        transformedDF = stopWordRemover.transform(dataset)
+        self.assertEqual(transformedDF.head().output, ["panda"])
+        self.assertEqual(type(stopWordRemover.getStopWords()), list)
+        self.assertTrue(isinstance(stopWordRemover.getStopWords()[0], str))
+        # Custom
+        stopwords = ["panda"]
+        stopWordRemover.setStopWords(stopwords)
+        self.assertEqual(stopWordRemover.getInputCol(), "input")
+        self.assertEqual(stopWordRemover.getStopWords(), stopwords)
+        transformedDF = stopWordRemover.transform(dataset)
+        self.assertEqual(transformedDF.head().output, ["a"])
+        # with language selection
+        stopwords = StopWordsRemover.loadDefaultStopWords("turkish")
+        dataset = self.spark.createDataFrame([Row(input=["acaba", "ama", "biri"])])
+        stopWordRemover.setStopWords(stopwords)
+        self.assertEqual(stopWordRemover.getStopWords(), stopwords)
+        transformedDF = stopWordRemover.transform(dataset)
+        self.assertEqual(transformedDF.head().output, [])
+        # with locale
+        stopwords = ["BELKİ"]
+        dataset = self.spark.createDataFrame([Row(input=["belki"])])
+        stopWordRemover.setStopWords(stopwords).setLocale("tr")
+        self.assertEqual(stopWordRemover.getStopWords(), stopwords)
+        transformedDF = stopWordRemover.transform(dataset)
+        self.assertEqual(transformedDF.head().output, [])
+
+    def test_count_vectorizer_with_binary(self):
+        dataset = self.spark.createDataFrame([
+            (0, "a a a b b c".split(' '), SparseVector(3, {0: 1.0, 1: 1.0, 2: 1.0}),),
+            (1, "a a".split(' '), SparseVector(3, {0: 1.0}),),
+            (2, "a b".split(' '), SparseVector(3, {0: 1.0, 1: 1.0}),),
+            (3, "c".split(' '), SparseVector(3, {2: 1.0}),)], ["id", "words", "expected"])
+        cv = CountVectorizer(binary=True, inputCol="words", outputCol="features")
+        model = cv.fit(dataset)
+
+        transformedList = model.transform(dataset).select("features", "expected").collect()
+
+        for r in transformedList:
+            feature, expected = r
+            self.assertEqual(feature, expected)
+
+    def test_count_vectorizer_with_maxDF(self):
+        dataset = self.spark.createDataFrame([
+            (0, "a b c d".split(' '), SparseVector(3, {0: 1.0, 1: 1.0, 2: 1.0}),),
+            (1, "a b c".split(' '), SparseVector(3, {0: 1.0, 1: 1.0}),),
+            (2, "a b".split(' '), SparseVector(3, {0: 1.0}),),
+            (3, "a".split(' '), SparseVector(3,  {}),)], ["id", "words", "expected"])
+        cv = CountVectorizer(inputCol="words", outputCol="features")
+        model1 = cv.setMaxDF(3).fit(dataset)
+        self.assertEqual(model1.vocabulary, ['b', 'c', 'd'])
+
+        transformedList1 = model1.transform(dataset).select("features", "expected").collect()
+
+        for r in transformedList1:
+            feature, expected = r
+            self.assertEqual(feature, expected)
+
+        model2 = cv.setMaxDF(0.75).fit(dataset)
+        self.assertEqual(model2.vocabulary, ['b', 'c', 'd'])
+
+        transformedList2 = model2.transform(dataset).select("features", "expected").collect()
+
+        for r in transformedList2:
+            feature, expected = r
+            self.assertEqual(feature, expected)
+
+    def test_count_vectorizer_from_vocab(self):
+        model = CountVectorizerModel.from_vocabulary(["a", "b", "c"], inputCol="words",
+                                                     outputCol="features", minTF=2)
+        self.assertEqual(model.vocabulary, ["a", "b", "c"])
+        self.assertEqual(model.getMinTF(), 2)
+
+        dataset = self.spark.createDataFrame([
+            (0, "a a a b b c".split(' '), SparseVector(3, {0: 3.0, 1: 2.0}),),
+            (1, "a a".split(' '), SparseVector(3, {0: 2.0}),),
+            (2, "a b".split(' '), SparseVector(3, {}),)], ["id", "words", "expected"])
+
+        transformed_list = model.transform(dataset).select("features", "expected").collect()
+
+        for r in transformed_list:
+            feature, expected = r
+            self.assertEqual(feature, expected)
+
+        # Test an empty vocabulary
+        with QuietTest(self.sc):
+            with self.assertRaisesRegex(Exception, "vocabSize.*invalid.*0"):
+                CountVectorizerModel.from_vocabulary([], inputCol="words")
+
+        # Test model with default settings can transform
+        model_default = CountVectorizerModel.from_vocabulary(["a", "b", "c"], inputCol="words")
+        transformed_list = model_default.transform(dataset) \
+            .select(model_default.getOrDefault(model_default.outputCol)).collect()
+        self.assertEqual(len(transformed_list), 3)
+
+    def test_rformula_force_index_label(self):
+        df = self.spark.createDataFrame([
+            (1.0, 1.0, "a"),
+            (0.0, 2.0, "b"),
+            (1.0, 0.0, "a")], ["y", "x", "s"])
+        # Does not index label by default since it's numeric type.
+        rf = RFormula(formula="y ~ x + s")
+        model = rf.fit(df)
+        transformedDF = model.transform(df)
+        self.assertEqual(transformedDF.head().label, 1.0)
+        # Force to index label.
+        rf2 = RFormula(formula="y ~ x + s").setForceIndexLabel(True)
+        model2 = rf2.fit(df)
+        transformedDF2 = model2.transform(df)
+        self.assertEqual(transformedDF2.head().label, 0.0)
+
+    def test_rformula_string_indexer_order_type(self):
+        df = self.spark.createDataFrame([
+            (1.0, 1.0, "a"),
+            (0.0, 2.0, "b"),
+            (1.0, 0.0, "a")], ["y", "x", "s"])
+        rf = RFormula(formula="y ~ x + s", stringIndexerOrderType="alphabetDesc")
+        self.assertEqual(rf.getStringIndexerOrderType(), 'alphabetDesc')
+        transformedDF = rf.fit(df).transform(df)
+        observed = transformedDF.select("features").collect()
+        expected = [[1.0, 0.0], [2.0, 1.0], [0.0, 0.0]]
+        for i in range(0, len(expected)):
+            self.assertTrue(all(observed[i]["features"].toArray() == expected[i]))
+
+    def test_string_indexer_handle_invalid(self):
+        df = self.spark.createDataFrame([
+            (0, "a"),
+            (1, "d"),
+            (2, None)], ["id", "label"])
+
+        si1 = StringIndexer(inputCol="label", outputCol="indexed", handleInvalid="keep",
+                            stringOrderType="alphabetAsc")
+        model1 = si1.fit(df)
+        td1 = model1.transform(df)
+        actual1 = td1.select("id", "indexed").collect()
+        expected1 = [Row(id=0, indexed=0.0), Row(id=1, indexed=1.0), Row(id=2, indexed=2.0)]
+        self.assertEqual(actual1, expected1)
+
+        si2 = si1.setHandleInvalid("skip")
+        model2 = si2.fit(df)
+        td2 = model2.transform(df)
+        actual2 = td2.select("id", "indexed").collect()
+        expected2 = [Row(id=0, indexed=0.0), Row(id=1, indexed=1.0)]
+        self.assertEqual(actual2, expected2)
+
+    def test_string_indexer_from_labels(self):
+        model = StringIndexerModel.from_labels(["a", "b", "c"], inputCol="label",
+                                               outputCol="indexed", handleInvalid="keep")
+        self.assertEqual(model.labels, ["a", "b", "c"])
+        self.assertEqual(model.labelsArray, [("a", "b", "c")])
+
+        df1 = self.spark.createDataFrame([
+            (0, "a"),
+            (1, "c"),
+            (2, None),
+            (3, "b"),
+            (4, "b")], ["id", "label"])
+
+        result1 = model.transform(df1)
+        actual1 = result1.select("id", "indexed").collect()
+        expected1 = [Row(id=0, indexed=0.0), Row(id=1, indexed=2.0), Row(id=2, indexed=3.0),
+                     Row(id=3, indexed=1.0), Row(id=4, indexed=1.0)]
+        self.assertEqual(actual1, expected1)
+
+        model_empty_labels = StringIndexerModel.from_labels(
+            [], inputCol="label", outputCol="indexed", handleInvalid="keep")
+        actual2 = model_empty_labels.transform(df1).select("id", "indexed").collect()
+        expected2 = [Row(id=0, indexed=0.0), Row(id=1, indexed=0.0), Row(id=2, indexed=0.0),
+                     Row(id=3, indexed=0.0), Row(id=4, indexed=0.0)]
+        self.assertEqual(actual2, expected2)
+
+        # Test model with default settings can transform
+        model_default = StringIndexerModel.from_labels(["a", "b", "c"], inputCol="label")
+        df2 = self.spark.createDataFrame([
+            (0, "a"),
+            (1, "c"),
+            (2, "b"),
+            (3, "b"),
+            (4, "b")], ["id", "label"])
+        transformed_list = model_default.transform(df2) \
+            .select(model_default.getOrDefault(model_default.outputCol)).collect()
+        self.assertEqual(len(transformed_list), 5)
+
+    def test_vector_size_hint(self):
+        df = self.spark.createDataFrame(
+            [(0, Vectors.dense([0.0, 10.0, 0.5])),
+             (1, Vectors.dense([1.0, 11.0, 0.5, 0.6])),
+             (2, Vectors.dense([2.0, 12.0]))],
+            ["id", "vector"])
+
+        sizeHint = VectorSizeHint(
+            inputCol="vector",
+            handleInvalid="skip")
+        sizeHint.setSize(3)
+        self.assertEqual(sizeHint.getSize(), 3)
+
+        output = sizeHint.transform(df).head().vector
+        expected = DenseVector([0.0, 10.0, 0.5])
+        self.assertEqual(output, expected)
 
 
-class StandardScalerTests(MLlibTestCase):
-    def test_model_setters(self):
-        data = [
-            [1.0, 2.0, 3.0],
-            [2.0, 3.0, 4.0],
-            [3.0, 4.0, 5.0]
-        ]
-        model = StandardScaler().fit(self.sc.parallelize(data))
-        self.assertIsNotNone(model.setWithMean(True))
-        self.assertIsNotNone(model.setWithStd(True))
-        self.assertEqual(model.transform([1.0, 2.0, 3.0]), DenseVector([-1.0, -1.0, -1.0]))
+class HashingTFTest(SparkSessionTestCase):
 
-    def test_model_transform(self):
-        data = [
-            [1.0, 2.0, 3.0],
-            [2.0, 3.0, 4.0],
-            [3.0, 4.0, 5.0]
-        ]
-        model = StandardScaler().fit(self.sc.parallelize(data))
-        self.assertEqual(model.transform([1.0, 2.0, 3.0]), DenseVector([1.0, 2.0, 3.0]))
+    def test_apply_binary_term_freqs(self):
 
-
-class ElementwiseProductTests(MLlibTestCase):
-    def test_model_transform(self):
-        weight = Vectors.dense([3, 2, 1])
-
-        densevec = Vectors.dense([4, 5, 6])
-        sparsevec = Vectors.sparse(3, [0], [1])
-        eprod = ElementwiseProduct(weight)
-        self.assertEqual(eprod.transform(densevec), DenseVector([12, 10, 6]))
-        self.assertEqual(
-            eprod.transform(sparsevec), SparseVector(3, [0], [3]))
-
-
-class HashingTFTest(MLlibTestCase):
-
-    def test_binary_term_freqs(self):
-        hashingTF = HashingTF(100).setBinary(True)
-        doc = "a a b c c c".split(" ")
-        n = hashingTF.numFeatures
-        output = hashingTF.transform(doc).toArray()
-        expected = Vectors.sparse(n, {hashingTF.indexOf("a"): 1.0,
-                                      hashingTF.indexOf("b"): 1.0,
-                                      hashingTF.indexOf("c"): 1.0}).toArray()
+        df = self.spark.createDataFrame([(0, ["a", "a", "b", "c", "c", "c"])], ["id", "words"])
+        n = 10
+        hashingTF = HashingTF()
+        hashingTF.setInputCol("words").setOutputCol("features").setNumFeatures(n).setBinary(True)
+        output = hashingTF.transform(df)
+        features = output.select("features").first().features.toArray()
+        expected = Vectors.dense([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]).toArray()
         for i in range(0, n):
-            self.assertAlmostEqual(output[i], expected[i], 14, "Error at " + str(i) +
-                                   ": expected " + str(expected[i]) + ", got " + str(output[i]))
-
-
-class DimensionalityReductionTests(MLlibTestCase):
-
-    denseData = [
-        Vectors.dense([0.0, 1.0, 2.0]),
-        Vectors.dense([3.0, 4.0, 5.0]),
-        Vectors.dense([6.0, 7.0, 8.0]),
-        Vectors.dense([9.0, 0.0, 1.0])
-    ]
-    sparseData = [
-        Vectors.sparse(3, [(1, 1.0), (2, 2.0)]),
-        Vectors.sparse(3, [(0, 3.0), (1, 4.0), (2, 5.0)]),
-        Vectors.sparse(3, [(0, 6.0), (1, 7.0), (2, 8.0)]),
-        Vectors.sparse(3, [(0, 9.0), (2, 1.0)])
-    ]
-
-    def assertEqualUpToSign(self, vecA, vecB):
-        eq1 = vecA - vecB
-        eq2 = vecA + vecB
-        self.assertTrue(sum(abs(eq1)) < 1e-6 or sum(abs(eq2)) < 1e-6)
-
-    def test_svd(self):
-        denseMat = RowMatrix(self.sc.parallelize(self.denseData))
-        sparseMat = RowMatrix(self.sc.parallelize(self.sparseData))
-        m = 4
-        n = 3
-        for mat in [denseMat, sparseMat]:
-            for k in range(1, 4):
-                rm = mat.computeSVD(k, computeU=True)
-                self.assertEqual(rm.s.size, k)
-                self.assertEqual(rm.U.numRows(), m)
-                self.assertEqual(rm.U.numCols(), k)
-                self.assertEqual(rm.V.numRows, n)
-                self.assertEqual(rm.V.numCols, k)
-
-        # Test that U returned is None if computeU is set to False.
-        self.assertEqual(mat.computeSVD(1).U, None)
-
-        # Test that low rank matrices cannot have number of singular values
-        # greater than a limit.
-        rm = RowMatrix(self.sc.parallelize(tile([1, 2, 3], (3, 1))))
-        self.assertEqual(rm.computeSVD(3, False, 1e-6).s.size, 1)
-
-    def test_pca(self):
-        expected_pcs = array([
-            [0.0, 1.0, 0.0],
-            [sqrt(2.0) / 2.0, 0.0, sqrt(2.0) / 2.0],
-            [sqrt(2.0) / 2.0, 0.0, -sqrt(2.0) / 2.0]
-        ])
-        n = 3
-        denseMat = RowMatrix(self.sc.parallelize(self.denseData))
-        sparseMat = RowMatrix(self.sc.parallelize(self.sparseData))
-        for mat in [denseMat, sparseMat]:
-            for k in range(1, 4):
-                pcs = mat.computePrincipalComponents(k)
-                self.assertEqual(pcs.numRows, n)
-                self.assertEqual(pcs.numCols, k)
-
-                # We can just test the updated principal component for equality.
-                self.assertEqualUpToSign(pcs.toArray()[:, k - 1], expected_pcs[:, k - 1])
+            self.assertAlmostEqual(features[i], expected[i], 14, "Error at " + str(i) +
+                                   ": expected " + str(expected[i]) + ", got " + str(features[i]))
 
 
 if __name__ == "__main__":
-    from pyspark.mllib.tests.test_feature import *  # noqa: F401
+    from pyspark.ml.tests.test_feature import *  # noqa: F401
 
     try:
         import xmlrunner  # type: ignore[import]

@@ -16,645 +16,934 @@
 #
 
 import sys
+from abc import abstractmethod, ABCMeta
 
-from pyspark import since
-from pyspark.mllib.common import JavaModelWrapper, callMLlibFunc
-from pyspark.sql import SQLContext
-from pyspark.sql.types import ArrayType, StructField, StructType, DoubleType
+from pyspark import since, keyword_only
+from pyspark.ml.wrapper import JavaParams
+from pyspark.ml.param import Param, Params, TypeConverters
+from pyspark.ml.param.shared import HasLabelCol, HasPredictionCol, HasProbabilityCol, \
+    HasRawPredictionCol, HasFeaturesCol, HasWeightCol
+from pyspark.ml.common import inherit_doc
+from pyspark.ml.util import JavaMLReadable, JavaMLWritable
 
-__all__ = ['BinaryClassificationMetrics', 'RegressionMetrics',
-           'MulticlassMetrics', 'RankingMetrics']
+__all__ = ['Evaluator', 'BinaryClassificationEvaluator', 'RegressionEvaluator',
+           'MulticlassClassificationEvaluator', 'MultilabelClassificationEvaluator',
+           'ClusteringEvaluator', 'RankingEvaluator']
 
 
-class BinaryClassificationMetrics(JavaModelWrapper):
+@inherit_doc
+class Evaluator(Params, metaclass=ABCMeta):
     """
-    Evaluator for binary classification.
+    Base class for evaluators that compute metrics from predictions.
+
+    .. versionadded:: 1.4.0
+    """
+    pass
+
+    @abstractmethod
+    def _evaluate(self, dataset):
+        """
+        Evaluates the output.
+
+        Parameters
+        ----------
+        dataset : :py:class:`pyspark.sql.DataFrame`
+            a dataset that contains labels/observations and predictions
+
+        Returns
+        -------
+        float
+            metric
+        """
+        raise NotImplementedError()
+
+    def evaluate(self, dataset, params=None):
+        """
+        Evaluates the output with optional parameters.
+
+        .. versionadded:: 1.4.0
+
+        Parameters
+        ----------
+        dataset : :py:class:`pyspark.sql.DataFrame`
+            a dataset that contains labels/observations and predictions
+        params : dict, optional
+            an optional param map that overrides embedded params
+
+        Returns
+        -------
+        float
+            metric
+        """
+        if params is None:
+            params = dict()
+        if isinstance(params, dict):
+            if params:
+                return self.copy(params)._evaluate(dataset)
+            else:
+                return self._evaluate(dataset)
+        else:
+            raise TypeError("Params must be a param map but got %s." % type(params))
+
+    @since("1.5.0")
+    def isLargerBetter(self):
+        """
+        Indicates whether the metric returned by :py:meth:`evaluate` should be maximized
+        (True, default) or minimized (False).
+        A given evaluator may support multiple metrics which may be maximized or minimized.
+        """
+        return True
+
+
+@inherit_doc
+class JavaEvaluator(JavaParams, Evaluator, metaclass=ABCMeta):
+    """
+    Base class for :py:class:`Evaluator`s that wrap Java/Scala
+    implementations.
+    """
+
+    def _evaluate(self, dataset):
+        """
+        Evaluates the output.
+
+        Parameters
+        ----------
+        dataset : :py:class:`pyspark.sql.DataFrame`
+            a dataset that contains labels/observations and predictions
+
+        Returns
+        -------
+        float
+            evaluation metric
+        """
+        self._transfer_params_to_java()
+        return self._java_obj.evaluate(dataset._jdf)
+
+    def isLargerBetter(self):
+        self._transfer_params_to_java()
+        return self._java_obj.isLargerBetter()
+
+
+@inherit_doc
+class BinaryClassificationEvaluator(JavaEvaluator, HasLabelCol, HasRawPredictionCol, HasWeightCol,
+                                    JavaMLReadable, JavaMLWritable):
+    """
+    Evaluator for binary classification, which expects input columns rawPrediction, label
+    and an optional weight column.
+    The rawPrediction column can be of type double (binary 0/1 prediction, or probability of label
+    1) or of type vector (length-2 vector of raw predictions, scores, or label probabilities).
 
     .. versionadded:: 1.4.0
 
-    Parameters
-    ----------
-    scoreAndLabels : :py:class:`pyspark.RDD`
-        an RDD of score, label and optional weight.
-
     Examples
     --------
-    >>> scoreAndLabels = sc.parallelize([
-    ...     (0.1, 0.0), (0.1, 1.0), (0.4, 0.0), (0.6, 0.0), (0.6, 1.0), (0.6, 1.0), (0.8, 1.0)], 2)
-    >>> metrics = BinaryClassificationMetrics(scoreAndLabels)
-    >>> metrics.areaUnderROC
+    >>> from pyspark.ml.linalg import Vectors
+    >>> scoreAndLabels = map(lambda x: (Vectors.dense([1.0 - x[0], x[0]]), x[1]),
+    ...    [(0.1, 0.0), (0.1, 1.0), (0.4, 0.0), (0.6, 0.0), (0.6, 1.0), (0.6, 1.0), (0.8, 1.0)])
+    >>> dataset = spark.createDataFrame(scoreAndLabels, ["raw", "label"])
+    ...
+    >>> evaluator = BinaryClassificationEvaluator()
+    >>> evaluator.setRawPredictionCol("raw")
+    BinaryClassificationEvaluator...
+    >>> evaluator.evaluate(dataset)
     0.70...
-    >>> metrics.areaUnderPR
+    >>> evaluator.evaluate(dataset, {evaluator.metricName: "areaUnderPR"})
     0.83...
-    >>> metrics.unpersist()
-    >>> scoreAndLabelsWithOptWeight = sc.parallelize([
-    ...     (0.1, 0.0, 1.0), (0.1, 1.0, 0.4), (0.4, 0.0, 0.2), (0.6, 0.0, 0.6), (0.6, 1.0, 0.9),
-    ...     (0.6, 1.0, 0.5), (0.8, 1.0, 0.7)], 2)
-    >>> metrics = BinaryClassificationMetrics(scoreAndLabelsWithOptWeight)
-    >>> metrics.areaUnderROC
-    0.79...
-    >>> metrics.areaUnderPR
-    0.88...
+    >>> bce_path = temp_path + "/bce"
+    >>> evaluator.save(bce_path)
+    >>> evaluator2 = BinaryClassificationEvaluator.load(bce_path)
+    >>> str(evaluator2.getRawPredictionCol())
+    'raw'
+    >>> scoreAndLabelsAndWeight = map(lambda x: (Vectors.dense([1.0 - x[0], x[0]]), x[1], x[2]),
+    ...    [(0.1, 0.0, 1.0), (0.1, 1.0, 0.9), (0.4, 0.0, 0.7), (0.6, 0.0, 0.9),
+    ...     (0.6, 1.0, 1.0), (0.6, 1.0, 0.3), (0.8, 1.0, 1.0)])
+    >>> dataset = spark.createDataFrame(scoreAndLabelsAndWeight, ["raw", "label", "weight"])
+    ...
+    >>> evaluator = BinaryClassificationEvaluator(rawPredictionCol="raw", weightCol="weight")
+    >>> evaluator.evaluate(dataset)
+    0.70...
+    >>> evaluator.evaluate(dataset, {evaluator.metricName: "areaUnderPR"})
+    0.82...
+    >>> evaluator.getNumBins()
+    1000
     """
 
-    def __init__(self, scoreAndLabels):
-        sc = scoreAndLabels.ctx
-        sql_ctx = SQLContext.getOrCreate(sc)
-        numCol = len(scoreAndLabels.first())
-        schema = StructType([
-            StructField("score", DoubleType(), nullable=False),
-            StructField("label", DoubleType(), nullable=False)])
-        if numCol == 3:
-            schema.add("weight", DoubleType(), False)
-        df = sql_ctx.createDataFrame(scoreAndLabels, schema=schema)
-        java_class = sc._jvm.org.apache.spark.mllib.evaluation.BinaryClassificationMetrics
-        java_model = java_class(df._jdf)
-        super(BinaryClassificationMetrics, self).__init__(java_model)
+    metricName = Param(Params._dummy(), "metricName",
+                       "metric name in evaluation (areaUnderROC|areaUnderPR)",
+                       typeConverter=TypeConverters.toString)
 
-    @property
-    @since('1.4.0')
-    def areaUnderROC(self):
-        """
-        Computes the area under the receiver operating characteristic
-        (ROC) curve.
-        """
-        return self.call("areaUnderROC")
+    numBins = Param(Params._dummy(), "numBins", "Number of bins to down-sample the curves "
+                    "(ROC curve, PR curve) in area computation. If 0, no down-sampling will "
+                    "occur. Must be >= 0.",
+                    typeConverter=TypeConverters.toInt)
 
-    @property
-    @since('1.4.0')
-    def areaUnderPR(self):
+    @keyword_only
+    def __init__(self, *, rawPredictionCol="rawPrediction", labelCol="label",
+                 metricName="areaUnderROC", weightCol=None, numBins=1000):
         """
-        Computes the area under the precision-recall curve.
+        __init__(self, \\*, rawPredictionCol="rawPrediction", labelCol="label", \
+                 metricName="areaUnderROC", weightCol=None, numBins=1000)
         """
-        return self.call("areaUnderPR")
+        super(BinaryClassificationEvaluator, self).__init__()
+        self._java_obj = self._new_java_obj(
+            "org.apache.spark.ml.evaluation.BinaryClassificationEvaluator", self.uid)
+        self._setDefault(metricName="areaUnderROC", numBins=1000)
+        kwargs = self._input_kwargs
+        self._set(**kwargs)
 
-    @since('1.4.0')
-    def unpersist(self):
+    @since("1.4.0")
+    def setMetricName(self, value):
         """
-        Unpersists intermediate RDDs used in the computation.
+        Sets the value of :py:attr:`metricName`.
         """
-        self.call("unpersist")
+        return self._set(metricName=value)
+
+    @since("1.4.0")
+    def getMetricName(self):
+        """
+        Gets the value of metricName or its default value.
+        """
+        return self.getOrDefault(self.metricName)
+
+    @since("3.0.0")
+    def setNumBins(self, value):
+        """
+        Sets the value of :py:attr:`numBins`.
+        """
+        return self._set(numBins=value)
+
+    @since("3.0.0")
+    def getNumBins(self):
+        """
+        Gets the value of numBins or its default value.
+        """
+        return self.getOrDefault(self.numBins)
+
+    def setLabelCol(self, value):
+        """
+        Sets the value of :py:attr:`labelCol`.
+        """
+        return self._set(labelCol=value)
+
+    def setRawPredictionCol(self, value):
+        """
+        Sets the value of :py:attr:`rawPredictionCol`.
+        """
+        return self._set(rawPredictionCol=value)
+
+    @since("3.0.0")
+    def setWeightCol(self, value):
+        """
+        Sets the value of :py:attr:`weightCol`.
+        """
+        return self._set(weightCol=value)
+
+    @keyword_only
+    @since("1.4.0")
+    def setParams(self, *, rawPredictionCol="rawPrediction", labelCol="label",
+                  metricName="areaUnderROC", weightCol=None, numBins=1000):
+        """
+        setParams(self, \\*, rawPredictionCol="rawPrediction", labelCol="label", \
+                  metricName="areaUnderROC", weightCol=None, numBins=1000)
+        Sets params for binary classification evaluator.
+        """
+        kwargs = self._input_kwargs
+        return self._set(**kwargs)
 
 
-class RegressionMetrics(JavaModelWrapper):
+@inherit_doc
+class RegressionEvaluator(JavaEvaluator, HasLabelCol, HasPredictionCol, HasWeightCol,
+                          JavaMLReadable, JavaMLWritable):
     """
-    Evaluator for regression.
+    Evaluator for Regression, which expects input columns prediction, label
+    and an optional weight column.
 
     .. versionadded:: 1.4.0
 
-    Parameters
-    ----------
-    predictionAndObservations : :py:class:`pyspark.RDD`
-        an RDD of prediction, observation and optional weight.
+    Examples
+    --------
+    >>> scoreAndLabels = [(-28.98343821, -27.0), (20.21491975, 21.5),
+    ...   (-25.98418959, -22.0), (30.69731842, 33.0), (74.69283752, 71.0)]
+    >>> dataset = spark.createDataFrame(scoreAndLabels, ["raw", "label"])
+    ...
+    >>> evaluator = RegressionEvaluator()
+    >>> evaluator.setPredictionCol("raw")
+    RegressionEvaluator...
+    >>> evaluator.evaluate(dataset)
+    2.842...
+    >>> evaluator.evaluate(dataset, {evaluator.metricName: "r2"})
+    0.993...
+    >>> evaluator.evaluate(dataset, {evaluator.metricName: "mae"})
+    2.649...
+    >>> re_path = temp_path + "/re"
+    >>> evaluator.save(re_path)
+    >>> evaluator2 = RegressionEvaluator.load(re_path)
+    >>> str(evaluator2.getPredictionCol())
+    'raw'
+    >>> scoreAndLabelsAndWeight = [(-28.98343821, -27.0, 1.0), (20.21491975, 21.5, 0.8),
+    ...   (-25.98418959, -22.0, 1.0), (30.69731842, 33.0, 0.6), (74.69283752, 71.0, 0.2)]
+    >>> dataset = spark.createDataFrame(scoreAndLabelsAndWeight, ["raw", "label", "weight"])
+    ...
+    >>> evaluator = RegressionEvaluator(predictionCol="raw", weightCol="weight")
+    >>> evaluator.evaluate(dataset)
+    2.740...
+    >>> evaluator.getThroughOrigin()
+    False
+    """
+    metricName = Param(Params._dummy(), "metricName",
+                       """metric name in evaluation - one of:
+                       rmse - root mean squared error (default)
+                       mse - mean squared error
+                       r2 - r^2 metric
+                       mae - mean absolute error
+                       var - explained variance.""",
+                       typeConverter=TypeConverters.toString)
+
+    throughOrigin = Param(Params._dummy(), "throughOrigin",
+                          "whether the regression is through the origin.",
+                          typeConverter=TypeConverters.toBoolean)
+
+    @keyword_only
+    def __init__(self, *, predictionCol="prediction", labelCol="label",
+                 metricName="rmse", weightCol=None, throughOrigin=False):
+        """
+        __init__(self, \\*, predictionCol="prediction", labelCol="label", \
+                 metricName="rmse", weightCol=None, throughOrigin=False)
+        """
+        super(RegressionEvaluator, self).__init__()
+        self._java_obj = self._new_java_obj(
+            "org.apache.spark.ml.evaluation.RegressionEvaluator", self.uid)
+        self._setDefault(metricName="rmse", throughOrigin=False)
+        kwargs = self._input_kwargs
+        self._set(**kwargs)
+
+    @since("1.4.0")
+    def setMetricName(self, value):
+        """
+        Sets the value of :py:attr:`metricName`.
+        """
+        return self._set(metricName=value)
+
+    @since("1.4.0")
+    def getMetricName(self):
+        """
+        Gets the value of metricName or its default value.
+        """
+        return self.getOrDefault(self.metricName)
+
+    @since("3.0.0")
+    def setThroughOrigin(self, value):
+        """
+        Sets the value of :py:attr:`throughOrigin`.
+        """
+        return self._set(throughOrigin=value)
+
+    @since("3.0.0")
+    def getThroughOrigin(self):
+        """
+        Gets the value of throughOrigin or its default value.
+        """
+        return self.getOrDefault(self.throughOrigin)
+
+    def setLabelCol(self, value):
+        """
+        Sets the value of :py:attr:`labelCol`.
+        """
+        return self._set(labelCol=value)
+
+    def setPredictionCol(self, value):
+        """
+        Sets the value of :py:attr:`predictionCol`.
+        """
+        return self._set(predictionCol=value)
+
+    @since("3.0.0")
+    def setWeightCol(self, value):
+        """
+        Sets the value of :py:attr:`weightCol`.
+        """
+        return self._set(weightCol=value)
+
+    @keyword_only
+    @since("1.4.0")
+    def setParams(self, *, predictionCol="prediction", labelCol="label",
+                  metricName="rmse", weightCol=None, throughOrigin=False):
+        """
+        setParams(self, \\*, predictionCol="prediction", labelCol="label", \
+                  metricName="rmse", weightCol=None, throughOrigin=False)
+        Sets params for regression evaluator.
+        """
+        kwargs = self._input_kwargs
+        return self._set(**kwargs)
+
+
+@inherit_doc
+class MulticlassClassificationEvaluator(JavaEvaluator, HasLabelCol, HasPredictionCol, HasWeightCol,
+                                        HasProbabilityCol, JavaMLReadable, JavaMLWritable):
+    """
+    Evaluator for Multiclass Classification, which expects input
+    columns: prediction, label, weight (optional) and probabilityCol (only for logLoss).
+
+    .. versionadded:: 1.5.0
 
     Examples
     --------
-    >>> predictionAndObservations = sc.parallelize([
-    ...     (2.5, 3.0), (0.0, -0.5), (2.0, 2.0), (8.0, 7.0)])
-    >>> metrics = RegressionMetrics(predictionAndObservations)
-    >>> metrics.explainedVariance
-    8.859...
-    >>> metrics.meanAbsoluteError
-    0.5...
-    >>> metrics.meanSquaredError
-    0.37...
-    >>> metrics.rootMeanSquaredError
-    0.61...
-    >>> metrics.r2
-    0.94...
-    >>> predictionAndObservationsWithOptWeight = sc.parallelize([
-    ...     (2.5, 3.0, 0.5), (0.0, -0.5, 1.0), (2.0, 2.0, 0.3), (8.0, 7.0, 0.9)])
-    >>> metrics = RegressionMetrics(predictionAndObservationsWithOptWeight)
-    >>> metrics.rootMeanSquaredError
-    0.68...
-    """
-
-    def __init__(self, predictionAndObservations):
-        sc = predictionAndObservations.ctx
-        sql_ctx = SQLContext.getOrCreate(sc)
-        numCol = len(predictionAndObservations.first())
-        schema = StructType([
-            StructField("prediction", DoubleType(), nullable=False),
-            StructField("observation", DoubleType(), nullable=False)])
-        if numCol == 3:
-            schema.add("weight", DoubleType(), False)
-        df = sql_ctx.createDataFrame(predictionAndObservations, schema=schema)
-        java_class = sc._jvm.org.apache.spark.mllib.evaluation.RegressionMetrics
-        java_model = java_class(df._jdf)
-        super(RegressionMetrics, self).__init__(java_model)
-
-    @property
-    @since('1.4.0')
-    def explainedVariance(self):
-        r"""
-        Returns the explained variance regression score.
-        explainedVariance = :math:`1 - \frac{variance(y - \hat{y})}{variance(y)}`
-        """
-        return self.call("explainedVariance")
-
-    @property
-    @since('1.4.0')
-    def meanAbsoluteError(self):
-        """
-        Returns the mean absolute error, which is a risk function corresponding to the
-        expected value of the absolute error loss or l1-norm loss.
-        """
-        return self.call("meanAbsoluteError")
-
-    @property
-    @since('1.4.0')
-    def meanSquaredError(self):
-        """
-        Returns the mean squared error, which is a risk function corresponding to the
-        expected value of the squared error loss or quadratic loss.
-        """
-        return self.call("meanSquaredError")
-
-    @property
-    @since('1.4.0')
-    def rootMeanSquaredError(self):
-        """
-        Returns the root mean squared error, which is defined as the square root of
-        the mean squared error.
-        """
-        return self.call("rootMeanSquaredError")
-
-    @property
-    @since('1.4.0')
-    def r2(self):
-        """
-        Returns R^2^, the coefficient of determination.
-        """
-        return self.call("r2")
-
-
-class MulticlassMetrics(JavaModelWrapper):
-    """
-    Evaluator for multiclass classification.
-
-    .. versionadded:: 1.4.0
-
-    Parameters
-    ----------
-    predictionAndLabels : :py:class:`pyspark.RDD`
-        an RDD of prediction, label, optional weight and optional probability.
-
-    Examples
-    --------
-    >>> predictionAndLabels = sc.parallelize([(0.0, 0.0), (0.0, 1.0), (0.0, 0.0),
-    ...     (1.0, 0.0), (1.0, 1.0), (1.0, 1.0), (1.0, 1.0), (2.0, 2.0), (2.0, 0.0)])
-    >>> metrics = MulticlassMetrics(predictionAndLabels)
-    >>> metrics.confusionMatrix().toArray()
-    array([[ 2.,  1.,  1.],
-           [ 1.,  3.,  0.],
-           [ 0.,  0.,  1.]])
-    >>> metrics.falsePositiveRate(0.0)
-    0.2...
-    >>> metrics.precision(1.0)
+    >>> scoreAndLabels = [(0.0, 0.0), (0.0, 1.0), (0.0, 0.0),
+    ...     (1.0, 0.0), (1.0, 1.0), (1.0, 1.0), (1.0, 1.0), (2.0, 2.0), (2.0, 0.0)]
+    >>> dataset = spark.createDataFrame(scoreAndLabels, ["prediction", "label"])
+    >>> evaluator = MulticlassClassificationEvaluator()
+    >>> evaluator.setPredictionCol("prediction")
+    MulticlassClassificationEvaluator...
+    >>> evaluator.evaluate(dataset)
+    0.66...
+    >>> evaluator.evaluate(dataset, {evaluator.metricName: "accuracy"})
+    0.66...
+    >>> evaluator.evaluate(dataset, {evaluator.metricName: "truePositiveRateByLabel",
+    ...     evaluator.metricLabel: 1.0})
     0.75...
-    >>> metrics.recall(2.0)
-    1.0...
-    >>> metrics.fMeasure(0.0, 2.0)
-    0.52...
-    >>> metrics.accuracy
+    >>> evaluator.setMetricName("hammingLoss")
+    MulticlassClassificationEvaluator...
+    >>> evaluator.evaluate(dataset)
+    0.33...
+    >>> mce_path = temp_path + "/mce"
+    >>> evaluator.save(mce_path)
+    >>> evaluator2 = MulticlassClassificationEvaluator.load(mce_path)
+    >>> str(evaluator2.getPredictionCol())
+    'prediction'
+    >>> scoreAndLabelsAndWeight = [(0.0, 0.0, 1.0), (0.0, 1.0, 1.0), (0.0, 0.0, 1.0),
+    ...     (1.0, 0.0, 1.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0),
+    ...     (2.0, 2.0, 1.0), (2.0, 0.0, 1.0)]
+    >>> dataset = spark.createDataFrame(scoreAndLabelsAndWeight, ["prediction", "label", "weight"])
+    >>> evaluator = MulticlassClassificationEvaluator(predictionCol="prediction",
+    ...     weightCol="weight")
+    >>> evaluator.evaluate(dataset)
     0.66...
-    >>> metrics.weightedFalsePositiveRate
-    0.19...
-    >>> metrics.weightedPrecision
-    0.68...
-    >>> metrics.weightedRecall
+    >>> evaluator.evaluate(dataset, {evaluator.metricName: "accuracy"})
     0.66...
-    >>> metrics.weightedFMeasure()
-    0.66...
-    >>> metrics.weightedFMeasure(2.0)
-    0.65...
-    >>> predAndLabelsWithOptWeight = sc.parallelize([(0.0, 0.0, 1.0), (0.0, 1.0, 1.0),
-    ...      (0.0, 0.0, 1.0), (1.0, 0.0, 1.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0),
-    ...      (2.0, 2.0, 1.0), (2.0, 0.0, 1.0)])
-    >>> metrics = MulticlassMetrics(predAndLabelsWithOptWeight)
-    >>> metrics.confusionMatrix().toArray()
-    array([[ 2.,  1.,  1.],
-           [ 1.,  3.,  0.],
-           [ 0.,  0.,  1.]])
-    >>> metrics.falsePositiveRate(0.0)
-    0.2...
-    >>> metrics.precision(1.0)
-    0.75...
-    >>> metrics.recall(2.0)
-    1.0...
-    >>> metrics.fMeasure(0.0, 2.0)
-    0.52...
-    >>> metrics.accuracy
-    0.66...
-    >>> metrics.weightedFalsePositiveRate
-    0.19...
-    >>> metrics.weightedPrecision
-    0.68...
-    >>> metrics.weightedRecall
-    0.66...
-    >>> metrics.weightedFMeasure()
-    0.66...
-    >>> metrics.weightedFMeasure(2.0)
-    0.65...
-    >>> predictionAndLabelsWithProbabilities = sc.parallelize([
+    >>> predictionAndLabelsWithProbabilities = [
     ...      (1.0, 1.0, 1.0, [0.1, 0.8, 0.1]), (0.0, 2.0, 1.0, [0.9, 0.05, 0.05]),
-    ...      (0.0, 0.0, 1.0, [0.8, 0.2, 0.0]), (1.0, 1.0, 1.0, [0.3, 0.65, 0.05])])
-    >>> metrics = MulticlassMetrics(predictionAndLabelsWithProbabilities)
-    >>> metrics.logLoss()
+    ...      (0.0, 0.0, 1.0, [0.8, 0.2, 0.0]), (1.0, 1.0, 1.0, [0.3, 0.65, 0.05])]
+    >>> dataset = spark.createDataFrame(predictionAndLabelsWithProbabilities, ["prediction",
+    ...     "label", "weight", "probability"])
+    >>> evaluator = MulticlassClassificationEvaluator(predictionCol="prediction",
+    ...     probabilityCol="probability")
+    >>> evaluator.setMetricName("logLoss")
+    MulticlassClassificationEvaluator...
+    >>> evaluator.evaluate(dataset)
     0.9682...
     """
+    metricName = Param(Params._dummy(), "metricName",
+                       "metric name in evaluation "
+                       "(f1|accuracy|weightedPrecision|weightedRecall|weightedTruePositiveRate| "
+                       "weightedFalsePositiveRate|weightedFMeasure|truePositiveRateByLabel| "
+                       "falsePositiveRateByLabel|precisionByLabel|recallByLabel|fMeasureByLabel| "
+                       "logLoss|hammingLoss)",
+                       typeConverter=TypeConverters.toString)
+    metricLabel = Param(Params._dummy(), "metricLabel",
+                        "The class whose metric will be computed in truePositiveRateByLabel|"
+                        "falsePositiveRateByLabel|precisionByLabel|recallByLabel|fMeasureByLabel."
+                        " Must be >= 0. The default value is 0.",
+                        typeConverter=TypeConverters.toFloat)
+    beta = Param(Params._dummy(), "beta",
+                 "The beta value used in weightedFMeasure|fMeasureByLabel."
+                 " Must be > 0. The default value is 1.",
+                 typeConverter=TypeConverters.toFloat)
+    eps = Param(Params._dummy(), "eps",
+                "log-loss is undefined for p=0 or p=1, so probabilities are clipped to "
+                "max(eps, min(1 - eps, p)). "
+                "Must be in range (0, 0.5). The default value is 1e-15.",
+                typeConverter=TypeConverters.toFloat)
 
-    def __init__(self, predictionAndLabels):
-        sc = predictionAndLabels.ctx
-        sql_ctx = SQLContext.getOrCreate(sc)
-        numCol = len(predictionAndLabels.first())
-        schema = StructType([
-            StructField("prediction", DoubleType(), nullable=False),
-            StructField("label", DoubleType(), nullable=False)])
-        if numCol >= 3:
-            schema.add("weight", DoubleType(), False)
-        if numCol == 4:
-            schema.add("probability", ArrayType(DoubleType(), False), False)
-        df = sql_ctx.createDataFrame(predictionAndLabels, schema)
-        java_class = sc._jvm.org.apache.spark.mllib.evaluation.MulticlassMetrics
-        java_model = java_class(df._jdf)
-        super(MulticlassMetrics, self).__init__(java_model)
+    @keyword_only
+    def __init__(self, *, predictionCol="prediction", labelCol="label",
+                 metricName="f1", weightCol=None, metricLabel=0.0, beta=1.0,
+                 probabilityCol="probability", eps=1e-15):
+        """
+        __init__(self, \\*, predictionCol="prediction", labelCol="label", \
+                 metricName="f1", weightCol=None, metricLabel=0.0, beta=1.0, \
+                 probabilityCol="probability", eps=1e-15)
+        """
+        super(MulticlassClassificationEvaluator, self).__init__()
+        self._java_obj = self._new_java_obj(
+            "org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator", self.uid)
+        self._setDefault(metricName="f1", metricLabel=0.0, beta=1.0, eps=1e-15)
+        kwargs = self._input_kwargs
+        self._set(**kwargs)
 
-    @since('1.4.0')
-    def confusionMatrix(self):
+    @since("1.5.0")
+    def setMetricName(self, value):
         """
-        Returns confusion matrix: predicted classes are in columns,
-        they are ordered by class label ascending, as in "labels".
+        Sets the value of :py:attr:`metricName`.
         """
-        return self.call("confusionMatrix")
+        return self._set(metricName=value)
 
-    @since('1.4.0')
-    def truePositiveRate(self, label):
+    @since("1.5.0")
+    def getMetricName(self):
         """
-        Returns true positive rate for a given label (category).
+        Gets the value of metricName or its default value.
         """
-        return self.call("truePositiveRate", label)
+        return self.getOrDefault(self.metricName)
 
-    @since('1.4.0')
-    def falsePositiveRate(self, label):
+    @since("3.0.0")
+    def setMetricLabel(self, value):
         """
-        Returns false positive rate for a given label (category).
+        Sets the value of :py:attr:`metricLabel`.
         """
-        return self.call("falsePositiveRate", label)
+        return self._set(metricLabel=value)
 
-    @since('1.4.0')
-    def precision(self, label):
+    @since("3.0.0")
+    def getMetricLabel(self):
         """
-        Returns precision.
+        Gets the value of metricLabel or its default value.
         """
-        return self.call("precision", float(label))
+        return self.getOrDefault(self.metricLabel)
 
-    @since('1.4.0')
-    def recall(self, label):
+    @since("3.0.0")
+    def setBeta(self, value):
         """
-        Returns recall.
+        Sets the value of :py:attr:`beta`.
         """
-        return self.call("recall", float(label))
+        return self._set(beta=value)
 
-    @since('1.4.0')
-    def fMeasure(self, label, beta=None):
+    @since("3.0.0")
+    def getBeta(self):
         """
-        Returns f-measure.
+        Gets the value of beta or its default value.
         """
-        if beta is None:
-            return self.call("fMeasure", label)
-        else:
-            return self.call("fMeasure", label, beta)
+        return self.getOrDefault(self.beta)
 
-    @property
-    @since('2.0.0')
-    def accuracy(self):
+    @since("3.0.0")
+    def setEps(self, value):
         """
-        Returns accuracy (equals to the total number of correctly classified instances
-        out of the total number of instances).
+        Sets the value of :py:attr:`eps`.
         """
-        return self.call("accuracy")
+        return self._set(eps=value)
 
-    @property
-    @since('1.4.0')
-    def weightedTruePositiveRate(self):
+    @since("3.0.0")
+    def getEps(self):
         """
-        Returns weighted true positive rate.
-        (equals to precision, recall and f-measure)
+        Gets the value of eps or its default value.
         """
-        return self.call("weightedTruePositiveRate")
+        return self.getOrDefault(self.eps)
 
-    @property
-    @since('1.4.0')
-    def weightedFalsePositiveRate(self):
+    def setLabelCol(self, value):
         """
-        Returns weighted false positive rate.
+        Sets the value of :py:attr:`labelCol`.
         """
-        return self.call("weightedFalsePositiveRate")
+        return self._set(labelCol=value)
 
-    @property
-    @since('1.4.0')
-    def weightedRecall(self):
+    def setPredictionCol(self, value):
         """
-        Returns weighted averaged recall.
-        (equals to precision, recall and f-measure)
+        Sets the value of :py:attr:`predictionCol`.
         """
-        return self.call("weightedRecall")
+        return self._set(predictionCol=value)
 
-    @property
-    @since('1.4.0')
-    def weightedPrecision(self):
+    @since("3.0.0")
+    def setProbabilityCol(self, value):
         """
-        Returns weighted averaged precision.
+        Sets the value of :py:attr:`probabilityCol`.
         """
-        return self.call("weightedPrecision")
+        return self._set(probabilityCol=value)
 
-    @since('1.4.0')
-    def weightedFMeasure(self, beta=None):
+    @since("3.0.0")
+    def setWeightCol(self, value):
         """
-        Returns weighted averaged f-measure.
+        Sets the value of :py:attr:`weightCol`.
         """
-        if beta is None:
-            return self.call("weightedFMeasure")
-        else:
-            return self.call("weightedFMeasure", beta)
+        return self._set(weightCol=value)
 
-    @since('3.0.0')
-    def logLoss(self, eps=1e-15):
+    @keyword_only
+    @since("1.5.0")
+    def setParams(self, *, predictionCol="prediction", labelCol="label",
+                  metricName="f1", weightCol=None, metricLabel=0.0, beta=1.0,
+                  probabilityCol="probability", eps=1e-15):
         """
-        Returns weighted logLoss.
+        setParams(self, \\*, predictionCol="prediction", labelCol="label", \
+                  metricName="f1", weightCol=None, metricLabel=0.0, beta=1.0, \
+                  probabilityCol="probability", eps=1e-15)
+        Sets params for multiclass classification evaluator.
         """
-        return self.call("logLoss", eps)
+        kwargs = self._input_kwargs
+        return self._set(**kwargs)
 
 
-class RankingMetrics(JavaModelWrapper):
+@inherit_doc
+class MultilabelClassificationEvaluator(JavaEvaluator, HasLabelCol, HasPredictionCol,
+                                        JavaMLReadable, JavaMLWritable):
     """
-    Evaluator for ranking algorithms.
+    Evaluator for Multilabel Classification, which expects two input
+    columns: prediction and label.
 
-    .. versionadded:: 1.4.0
+    .. versionadded:: 3.0.0
 
-    Parameters
-    ----------
-    predictionAndLabels : :py:class:`pyspark.RDD`
-        an RDD of (predicted ranking, ground truth set) pairs.
+    Notes
+    -----
+    Experimental
 
     Examples
     --------
-    >>> predictionAndLabels = sc.parallelize([
-    ...     ([1, 6, 2, 7, 8, 3, 9, 10, 4, 5], [1, 2, 3, 4, 5]),
-    ...     ([4, 1, 5, 6, 2, 7, 3, 8, 9, 10], [1, 2, 3]),
-    ...     ([1, 2, 3, 4, 5], [])])
-    >>> metrics = RankingMetrics(predictionAndLabels)
-    >>> metrics.precisionAt(1)
-    0.33...
-    >>> metrics.precisionAt(5)
-    0.26...
-    >>> metrics.precisionAt(15)
-    0.17...
-    >>> metrics.meanAveragePrecision
-    0.35...
-    >>> metrics.meanAveragePrecisionAt(1)
-    0.3333333333333333...
-    >>> metrics.meanAveragePrecisionAt(2)
-    0.25...
-    >>> metrics.ndcgAt(3)
-    0.33...
-    >>> metrics.ndcgAt(10)
-    0.48...
-    >>> metrics.recallAt(1)
-    0.06...
-    >>> metrics.recallAt(5)
-    0.35...
-    >>> metrics.recallAt(15)
-    0.66...
-    """
-
-    def __init__(self, predictionAndLabels):
-        sc = predictionAndLabels.ctx
-        sql_ctx = SQLContext.getOrCreate(sc)
-        df = sql_ctx.createDataFrame(predictionAndLabels,
-                                     schema=sql_ctx._inferSchema(predictionAndLabels))
-        java_model = callMLlibFunc("newRankingMetrics", df._jdf)
-        super(RankingMetrics, self).__init__(java_model)
-
-    @since('1.4.0')
-    def precisionAt(self, k):
-        """
-        Compute the average precision of all the queries, truncated at ranking position k.
-
-        If for a query, the ranking algorithm returns n (n < k) results, the precision value
-        will be computed as #(relevant items retrieved) / k. This formula also applies when
-        the size of the ground truth set is less than k.
-
-        If a query has an empty ground truth set, zero will be used as precision together
-        with a log warning.
-        """
-        return self.call("precisionAt", int(k))
-
-    @property
-    @since('1.4.0')
-    def meanAveragePrecision(self):
-        """
-        Returns the mean average precision (MAP) of all the queries.
-        If a query has an empty ground truth set, the average precision will be zero and
-        a log warning is generated.
-        """
-        return self.call("meanAveragePrecision")
-
-    @since('3.0.0')
-    def meanAveragePrecisionAt(self, k):
-        """
-        Returns the mean average precision (MAP) at first k ranking of all the queries.
-        If a query has an empty ground truth set, the average precision will be zero and
-        a log warning is generated.
-        """
-        return self.call("meanAveragePrecisionAt", int(k))
-
-    @since('1.4.0')
-    def ndcgAt(self, k):
-        """
-        Compute the average NDCG value of all the queries, truncated at ranking position k.
-        The discounted cumulative gain at position k is computed as:
-        sum,,i=1,,^k^ (2^{relevance of ''i''th item}^ - 1) / log(i + 1),
-        and the NDCG is obtained by dividing the DCG value on the ground truth set.
-        In the current implementation, the relevance value is binary.
-        If a query has an empty ground truth set, zero will be used as NDCG together with
-        a log warning.
-        """
-        return self.call("ndcgAt", int(k))
-
-    @since('3.0.0')
-    def recallAt(self, k):
-        """
-        Compute the average recall of all the queries, truncated at ranking position k.
-
-        If for a query, the ranking algorithm returns n results, the recall value
-        will be computed as #(relevant items retrieved) / #(ground truth set).
-        This formula also applies when the size of the ground truth set is less than k.
-
-        If a query has an empty ground truth set, zero will be used as recall together
-        with a log warning.
-        """
-        return self.call("recallAt", int(k))
-
-
-class MultilabelMetrics(JavaModelWrapper):
-    """
-    Evaluator for multilabel classification.
-
-    .. versionadded:: 1.4.0
-
-    Parameters
-    ----------
-    predictionAndLabels : :py:class:`pyspark.RDD`
-        an RDD of (predictions, labels) pairs,
-        both are non-null Arrays, each with unique elements.
-
-    Examples
-    --------
-    >>> predictionAndLabels = sc.parallelize([([0.0, 1.0], [0.0, 2.0]), ([0.0, 2.0], [0.0, 1.0]),
+    >>> scoreAndLabels = [([0.0, 1.0], [0.0, 2.0]), ([0.0, 2.0], [0.0, 1.0]),
     ...     ([], [0.0]), ([2.0], [2.0]), ([2.0, 0.0], [2.0, 0.0]),
-    ...     ([0.0, 1.0, 2.0], [0.0, 1.0]), ([1.0], [1.0, 2.0])])
-    >>> metrics = MultilabelMetrics(predictionAndLabels)
-    >>> metrics.precision(0.0)
-    1.0
-    >>> metrics.recall(1.0)
-    0.66...
-    >>> metrics.f1Measure(2.0)
-    0.5
-    >>> metrics.precision()
-    0.66...
-    >>> metrics.recall()
-    0.64...
-    >>> metrics.f1Measure()
+    ...     ([0.0, 1.0, 2.0], [0.0, 1.0]), ([1.0], [1.0, 2.0])]
+    >>> dataset = spark.createDataFrame(scoreAndLabels, ["prediction", "label"])
+    ...
+    >>> evaluator = MultilabelClassificationEvaluator()
+    >>> evaluator.setPredictionCol("prediction")
+    MultilabelClassificationEvaluator...
+    >>> evaluator.evaluate(dataset)
     0.63...
-    >>> metrics.microPrecision
-    0.72...
-    >>> metrics.microRecall
-    0.66...
-    >>> metrics.microF1Measure
-    0.69...
-    >>> metrics.hammingLoss
-    0.33...
-    >>> metrics.subsetAccuracy
-    0.28...
-    >>> metrics.accuracy
+    >>> evaluator.evaluate(dataset, {evaluator.metricName: "accuracy"})
     0.54...
+    >>> mlce_path = temp_path + "/mlce"
+    >>> evaluator.save(mlce_path)
+    >>> evaluator2 = MultilabelClassificationEvaluator.load(mlce_path)
+    >>> str(evaluator2.getPredictionCol())
+    'prediction'
     """
+    metricName = Param(Params._dummy(), "metricName",
+                       "metric name in evaluation "
+                       "(subsetAccuracy|accuracy|hammingLoss|precision|recall|f1Measure|"
+                       "precisionByLabel|recallByLabel|f1MeasureByLabel|microPrecision|"
+                       "microRecall|microF1Measure)",
+                       typeConverter=TypeConverters.toString)
+    metricLabel = Param(Params._dummy(), "metricLabel",
+                        "The class whose metric will be computed in precisionByLabel|"
+                        "recallByLabel|f1MeasureByLabel. "
+                        "Must be >= 0. The default value is 0.",
+                        typeConverter=TypeConverters.toFloat)
 
-    def __init__(self, predictionAndLabels):
-        sc = predictionAndLabels.ctx
-        sql_ctx = SQLContext.getOrCreate(sc)
-        df = sql_ctx.createDataFrame(predictionAndLabels,
-                                     schema=sql_ctx._inferSchema(predictionAndLabels))
-        java_class = sc._jvm.org.apache.spark.mllib.evaluation.MultilabelMetrics
-        java_model = java_class(df._jdf)
-        super(MultilabelMetrics, self).__init__(java_model)
+    @keyword_only
+    def __init__(self, *, predictionCol="prediction", labelCol="label",
+                 metricName="f1Measure", metricLabel=0.0):
+        """
+        __init__(self, \\*, predictionCol="prediction", labelCol="label", \
+                 metricName="f1Measure", metricLabel=0.0)
+        """
+        super(MultilabelClassificationEvaluator, self).__init__()
+        self._java_obj = self._new_java_obj(
+            "org.apache.spark.ml.evaluation.MultilabelClassificationEvaluator", self.uid)
+        self._setDefault(metricName="f1Measure", metricLabel=0.0)
+        kwargs = self._input_kwargs
+        self._set(**kwargs)
 
-    @since('1.4.0')
-    def precision(self, label=None):
+    @since("3.0.0")
+    def setMetricName(self, value):
         """
-        Returns precision or precision for a given label (category) if specified.
+        Sets the value of :py:attr:`metricName`.
         """
-        if label is None:
-            return self.call("precision")
-        else:
-            return self.call("precision", float(label))
+        return self._set(metricName=value)
 
-    @since('1.4.0')
-    def recall(self, label=None):
+    @since("3.0.0")
+    def getMetricName(self):
         """
-        Returns recall or recall for a given label (category) if specified.
+        Gets the value of metricName or its default value.
         """
-        if label is None:
-            return self.call("recall")
-        else:
-            return self.call("recall", float(label))
+        return self.getOrDefault(self.metricName)
 
-    @since('1.4.0')
-    def f1Measure(self, label=None):
+    @since("3.0.0")
+    def setMetricLabel(self, value):
         """
-        Returns f1Measure or f1Measure for a given label (category) if specified.
+        Sets the value of :py:attr:`metricLabel`.
         """
-        if label is None:
-            return self.call("f1Measure")
-        else:
-            return self.call("f1Measure", float(label))
+        return self._set(metricLabel=value)
 
-    @property
-    @since('1.4.0')
-    def microPrecision(self):
+    @since("3.0.0")
+    def getMetricLabel(self):
         """
-        Returns micro-averaged label-based precision.
-        (equals to micro-averaged document-based precision)
+        Gets the value of metricLabel or its default value.
         """
-        return self.call("microPrecision")
+        return self.getOrDefault(self.metricLabel)
 
-    @property
-    @since('1.4.0')
-    def microRecall(self):
+    @since("3.0.0")
+    def setLabelCol(self, value):
         """
-        Returns micro-averaged label-based recall.
-        (equals to micro-averaged document-based recall)
+        Sets the value of :py:attr:`labelCol`.
         """
-        return self.call("microRecall")
+        return self._set(labelCol=value)
 
-    @property
-    @since('1.4.0')
-    def microF1Measure(self):
+    @since("3.0.0")
+    def setPredictionCol(self, value):
         """
-        Returns micro-averaged label-based f1-measure.
-        (equals to micro-averaged document-based f1-measure)
+        Sets the value of :py:attr:`predictionCol`.
         """
-        return self.call("microF1Measure")
+        return self._set(predictionCol=value)
 
-    @property
-    @since('1.4.0')
-    def hammingLoss(self):
+    @keyword_only
+    @since("3.0.0")
+    def setParams(self, *, predictionCol="prediction", labelCol="label",
+                  metricName="f1Measure", metricLabel=0.0):
         """
-        Returns Hamming-loss.
+        setParams(self, \\*, predictionCol="prediction", labelCol="label", \
+                  metricName="f1Measure", metricLabel=0.0)
+        Sets params for multilabel classification evaluator.
         """
-        return self.call("hammingLoss")
-
-    @property
-    @since('1.4.0')
-    def subsetAccuracy(self):
-        """
-        Returns subset accuracy.
-        (for equal sets of labels)
-        """
-        return self.call("subsetAccuracy")
-
-    @property
-    @since('1.4.0')
-    def accuracy(self):
-        """
-        Returns accuracy.
-        """
-        return self.call("accuracy")
+        kwargs = self._input_kwargs
+        return self._set(**kwargs)
 
 
-def _test():
-    import doctest
-    import numpy
-    from pyspark.sql import SparkSession
-    import pyspark.mllib.evaluation
-    try:
-        # Numpy 1.14+ changed it's string format.
-        numpy.set_printoptions(legacy='1.13')
-    except TypeError:
-        pass
-    globs = pyspark.mllib.evaluation.__dict__.copy()
-    spark = SparkSession.builder\
-        .master("local[4]")\
-        .appName("mllib.evaluation tests")\
-        .getOrCreate()
-    globs['sc'] = spark.sparkContext
-    (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
-    spark.stop()
-    if failure_count:
-        sys.exit(-1)
+@inherit_doc
+class ClusteringEvaluator(JavaEvaluator, HasPredictionCol, HasFeaturesCol, HasWeightCol,
+                          JavaMLReadable, JavaMLWritable):
+    """
+    Evaluator for Clustering results, which expects two input
+    columns: prediction and features. The metric computes the Silhouette
+    measure using the squared Euclidean distance.
+
+    The Silhouette is a measure for the validation of the consistency
+    within clusters. It ranges between 1 and -1, where a value close to
+    1 means that the points in a cluster are close to the other points
+    in the same cluster and far from the points of the other clusters.
+
+    .. versionadded:: 2.3.0
+
+    Examples
+    --------
+    >>> from pyspark.ml.linalg import Vectors
+    >>> featureAndPredictions = map(lambda x: (Vectors.dense(x[0]), x[1]),
+    ...     [([0.0, 0.5], 0.0), ([0.5, 0.0], 0.0), ([10.0, 11.0], 1.0),
+    ...     ([10.5, 11.5], 1.0), ([1.0, 1.0], 0.0), ([8.0, 6.0], 1.0)])
+    >>> dataset = spark.createDataFrame(featureAndPredictions, ["features", "prediction"])
+    ...
+    >>> evaluator = ClusteringEvaluator()
+    >>> evaluator.setPredictionCol("prediction")
+    ClusteringEvaluator...
+    >>> evaluator.evaluate(dataset)
+    0.9079...
+    >>> featureAndPredictionsWithWeight = map(lambda x: (Vectors.dense(x[0]), x[1], x[2]),
+    ...     [([0.0, 0.5], 0.0, 2.5), ([0.5, 0.0], 0.0, 2.5), ([10.0, 11.0], 1.0, 2.5),
+    ...     ([10.5, 11.5], 1.0, 2.5), ([1.0, 1.0], 0.0, 2.5), ([8.0, 6.0], 1.0, 2.5)])
+    >>> dataset = spark.createDataFrame(
+    ...     featureAndPredictionsWithWeight, ["features", "prediction", "weight"])
+    >>> evaluator = ClusteringEvaluator()
+    >>> evaluator.setPredictionCol("prediction")
+    ClusteringEvaluator...
+    >>> evaluator.setWeightCol("weight")
+    ClusteringEvaluator...
+    >>> evaluator.evaluate(dataset)
+    0.9079...
+    >>> ce_path = temp_path + "/ce"
+    >>> evaluator.save(ce_path)
+    >>> evaluator2 = ClusteringEvaluator.load(ce_path)
+    >>> str(evaluator2.getPredictionCol())
+    'prediction'
+    """
+    metricName = Param(Params._dummy(), "metricName",
+                       "metric name in evaluation (silhouette)",
+                       typeConverter=TypeConverters.toString)
+    distanceMeasure = Param(Params._dummy(), "distanceMeasure", "The distance measure. " +
+                            "Supported options: 'squaredEuclidean' and 'cosine'.",
+                            typeConverter=TypeConverters.toString)
+
+    @keyword_only
+    def __init__(self, *, predictionCol="prediction", featuresCol="features",
+                 metricName="silhouette", distanceMeasure="squaredEuclidean", weightCol=None):
+        """
+        __init__(self, \\*, predictionCol="prediction", featuresCol="features", \
+                 metricName="silhouette", distanceMeasure="squaredEuclidean", weightCol=None)
+        """
+        super(ClusteringEvaluator, self).__init__()
+        self._java_obj = self._new_java_obj(
+            "org.apache.spark.ml.evaluation.ClusteringEvaluator", self.uid)
+        self._setDefault(metricName="silhouette", distanceMeasure="squaredEuclidean")
+        kwargs = self._input_kwargs
+        self._set(**kwargs)
+
+    @keyword_only
+    @since("2.3.0")
+    def setParams(self, *, predictionCol="prediction", featuresCol="features",
+                  metricName="silhouette", distanceMeasure="squaredEuclidean", weightCol=None):
+        """
+        setParams(self, \\*, predictionCol="prediction", featuresCol="features", \
+                  metricName="silhouette", distanceMeasure="squaredEuclidean", weightCol=None)
+        Sets params for clustering evaluator.
+        """
+        kwargs = self._input_kwargs
+        return self._set(**kwargs)
+
+    @since("2.3.0")
+    def setMetricName(self, value):
+        """
+        Sets the value of :py:attr:`metricName`.
+        """
+        return self._set(metricName=value)
+
+    @since("2.3.0")
+    def getMetricName(self):
+        """
+        Gets the value of metricName or its default value.
+        """
+        return self.getOrDefault(self.metricName)
+
+    @since("2.4.0")
+    def setDistanceMeasure(self, value):
+        """
+        Sets the value of :py:attr:`distanceMeasure`.
+        """
+        return self._set(distanceMeasure=value)
+
+    @since("2.4.0")
+    def getDistanceMeasure(self):
+        """
+        Gets the value of `distanceMeasure`
+        """
+        return self.getOrDefault(self.distanceMeasure)
+
+    def setFeaturesCol(self, value):
+        """
+        Sets the value of :py:attr:`featuresCol`.
+        """
+        return self._set(featuresCol=value)
+
+    def setPredictionCol(self, value):
+        """
+        Sets the value of :py:attr:`predictionCol`.
+        """
+        return self._set(predictionCol=value)
+
+    @since("3.1.0")
+    def setWeightCol(self, value):
+        """
+        Sets the value of :py:attr:`weightCol`.
+        """
+        return self._set(weightCol=value)
+
+
+@inherit_doc
+class RankingEvaluator(JavaEvaluator, HasLabelCol, HasPredictionCol,
+                       JavaMLReadable, JavaMLWritable):
+    """
+    Evaluator for Ranking, which expects two input
+    columns: prediction and label.
+
+    .. versionadded:: 3.0.0
+
+    Notes
+    -----
+    Experimental
+
+    Examples
+    --------
+    >>> scoreAndLabels = [([1.0, 6.0, 2.0, 7.0, 8.0, 3.0, 9.0, 10.0, 4.0, 5.0],
+    ...     [1.0, 2.0, 3.0, 4.0, 5.0]),
+    ...     ([4.0, 1.0, 5.0, 6.0, 2.0, 7.0, 3.0, 8.0, 9.0, 10.0], [1.0, 2.0, 3.0]),
+    ...     ([1.0, 2.0, 3.0, 4.0, 5.0], [])]
+    >>> dataset = spark.createDataFrame(scoreAndLabels, ["prediction", "label"])
+    ...
+    >>> evaluator = RankingEvaluator()
+    >>> evaluator.setPredictionCol("prediction")
+    RankingEvaluator...
+    >>> evaluator.evaluate(dataset)
+    0.35...
+    >>> evaluator.evaluate(dataset, {evaluator.metricName: "precisionAtK", evaluator.k: 2})
+    0.33...
+    >>> ranke_path = temp_path + "/ranke"
+    >>> evaluator.save(ranke_path)
+    >>> evaluator2 = RankingEvaluator.load(ranke_path)
+    >>> str(evaluator2.getPredictionCol())
+    'prediction'
+    """
+    metricName = Param(Params._dummy(), "metricName",
+                       "metric name in evaluation "
+                       "(meanAveragePrecision|meanAveragePrecisionAtK|"
+                       "precisionAtK|ndcgAtK|recallAtK)",
+                       typeConverter=TypeConverters.toString)
+    k = Param(Params._dummy(), "k",
+              "The ranking position value used in meanAveragePrecisionAtK|precisionAtK|"
+              "ndcgAtK|recallAtK. Must be > 0. The default value is 10.",
+              typeConverter=TypeConverters.toInt)
+
+    @keyword_only
+    def __init__(self, *, predictionCol="prediction", labelCol="label",
+                 metricName="meanAveragePrecision", k=10):
+        """
+        __init__(self, \\*, predictionCol="prediction", labelCol="label", \
+                 metricName="meanAveragePrecision", k=10)
+        """
+        super(RankingEvaluator, self).__init__()
+        self._java_obj = self._new_java_obj(
+            "org.apache.spark.ml.evaluation.RankingEvaluator", self.uid)
+        self._setDefault(metricName="meanAveragePrecision", k=10)
+        kwargs = self._input_kwargs
+        self._set(**kwargs)
+
+    @since("3.0.0")
+    def setMetricName(self, value):
+        """
+        Sets the value of :py:attr:`metricName`.
+        """
+        return self._set(metricName=value)
+
+    @since("3.0.0")
+    def getMetricName(self):
+        """
+        Gets the value of metricName or its default value.
+        """
+        return self.getOrDefault(self.metricName)
+
+    @since("3.0.0")
+    def setK(self, value):
+        """
+        Sets the value of :py:attr:`k`.
+        """
+        return self._set(k=value)
+
+    @since("3.0.0")
+    def getK(self):
+        """
+        Gets the value of k or its default value.
+        """
+        return self.getOrDefault(self.k)
+
+    @since("3.0.0")
+    def setLabelCol(self, value):
+        """
+        Sets the value of :py:attr:`labelCol`.
+        """
+        return self._set(labelCol=value)
+
+    @since("3.0.0")
+    def setPredictionCol(self, value):
+        """
+        Sets the value of :py:attr:`predictionCol`.
+        """
+        return self._set(predictionCol=value)
+
+    @keyword_only
+    @since("3.0.0")
+    def setParams(self, *, predictionCol="prediction", labelCol="label",
+                  metricName="meanAveragePrecision", k=10):
+        """
+        setParams(self, \\*, predictionCol="prediction", labelCol="label", \
+                  metricName="meanAveragePrecision", k=10)
+        Sets params for ranking evaluator.
+        """
+        kwargs = self._input_kwargs
+        return self._set(**kwargs)
 
 
 if __name__ == "__main__":
-    _test()
+    import doctest
+    import tempfile
+    import pyspark.ml.evaluation
+    from pyspark.sql import SparkSession
+    globs = pyspark.ml.evaluation.__dict__.copy()
+    # The small batch size here ensures that we see multiple batches,
+    # even in these small test examples:
+    spark = SparkSession.builder\
+        .master("local[2]")\
+        .appName("ml.evaluation tests")\
+        .getOrCreate()
+    globs['spark'] = spark
+    temp_path = tempfile.mkdtemp()
+    globs['temp_path'] = temp_path
+    try:
+        (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+        spark.stop()
+    finally:
+        from shutil import rmtree
+        try:
+            rmtree(temp_path)
+        except OSError:
+            pass
+    if failure_count:
+        sys.exit(-1)

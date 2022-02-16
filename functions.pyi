@@ -16,11 +16,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from typing import Any, TypeVar
+from pyspark import SparkContext as SparkContext, since as since  # noqa: F401
+from pyspark.sql.column import Column as Column
 
-import pyspark.context
+def vector_to_array(col: Column) -> Column: ...
 
-C = TypeVar("C", bound=type)
-
-def callJavaFunc(sc: pyspark.context.SparkContext, func: Any, *args: Any) -> Any: ...
-def inherit_doc(cls: C) -> C: ...
+def array_to_vector(col: Column) -> Column: ...

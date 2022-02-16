@@ -15,688 +15,342 @@
 # limitations under the License.
 #
 
-import sys
-import random
-
-from pyspark import RDD, since
-from pyspark.mllib.common import callMLlibFunc, inherit_doc, JavaModelWrapper
-from pyspark.mllib.linalg import _convert_to_vector
-from pyspark.mllib.regression import LabeledPoint
-from pyspark.mllib.util import JavaLoader, JavaSaveable
-
-__all__ = ['DecisionTreeModel', 'DecisionTree', 'RandomForestModel',
-           'RandomForest', 'GradientBoostedTreesModel', 'GradientBoostedTrees']
+from pyspark import since
+from pyspark.ml.param import Params
+from pyspark.ml.param.shared import HasCheckpointInterval, HasSeed, HasWeightCol, Param, \
+    TypeConverters, HasMaxIter, HasStepSize, HasValidationIndicatorCol
+from pyspark.ml.wrapper import JavaPredictionModel
+from pyspark.ml.common import inherit_doc
 
 
-class TreeEnsembleModel(JavaModelWrapper, JavaSaveable):
-    """TreeEnsembleModel
-
-    .. versionadded:: 1.3.0
+@inherit_doc
+class _DecisionTreeModel(JavaPredictionModel):
     """
-    def predict(self, x):
-        """
-        Predict values for a single data point or an RDD of points using
-        the model trained.
+    Abstraction for Decision Tree models.
 
-        .. versionadded:: 1.3.0
-
-        Notes
-        -----
-        In Python, predict cannot currently be used within an RDD
-        transformation or action.
-        Call predict directly on the RDD instead.
-        """
-        if isinstance(x, RDD):
-            return self.call("predict", x.map(_convert_to_vector))
-
-        else:
-            return self.call("predict", _convert_to_vector(x))
-
-    @since("1.3.0")
-    def numTrees(self):
-        """
-        Get number of trees in ensemble.
-        """
-        return self.call("numTrees")
-
-    @since("1.3.0")
-    def totalNumNodes(self):
-        """
-        Get total number of nodes, summed over all trees in the ensemble.
-        """
-        return self.call("totalNumNodes")
-
-    def __repr__(self):
-        """ Summary of model """
-        return self._java_model.toString()
-
-    @since("1.3.0")
-    def toDebugString(self):
-        """ Full model """
-        return self._java_model.toDebugString()
-
-
-class DecisionTreeModel(JavaModelWrapper, JavaSaveable, JavaLoader):
+    .. versionadded:: 1.5.0
     """
-    A decision tree model for classification or regression.
 
-    .. versionadded:: 1.1.0
-    """
-    def predict(self, x):
-        """
-        Predict the label of one or more examples.
-
-        .. versionadded:: 1.1.0
-
-        Parameters
-        ----------
-        x : :py:class:`pyspark.mllib.linalg.Vector` or :py:class:`pyspark.RDD`
-            Data point (feature vector), or an RDD of data points (feature
-            vectors).
-
-        Notes
-        -----
-        In Python, predict cannot currently be used within an RDD
-        transformation or action.
-        Call predict directly on the RDD instead.
-        """
-        if isinstance(x, RDD):
-            return self.call("predict", x.map(_convert_to_vector))
-
-        else:
-            return self.call("predict", _convert_to_vector(x))
-
-    @since("1.1.0")
+    @property
+    @since("1.5.0")
     def numNodes(self):
-        """Get number of nodes in tree, including leaf nodes."""
-        return self._java_model.numNodes()
+        """Return number of nodes of the decision tree."""
+        return self._call_java("numNodes")
 
-    @since("1.1.0")
+    @property
+    @since("1.5.0")
     def depth(self):
-        """
-        Get depth of tree (e.g. depth 0 means 1 leaf node, depth 1
-        means 1 internal node + 2 leaf nodes).
-        """
-        return self._java_model.depth()
+        """Return depth of the decision tree."""
+        return self._call_java("depth")
 
-    def __repr__(self):
-        """ summary of model. """
-        return self._java_model.toString()
-
-    @since("1.2.0")
+    @property
+    @since("2.0.0")
     def toDebugString(self):
-        """ full model. """
-        return self._java_model.toDebugString()
+        """Full description of model."""
+        return self._call_java("toDebugString")
 
-    @classmethod
-    def _java_loader_class(cls):
-        return "org.apache.spark.mllib.tree.model.DecisionTreeModel"
+    @since("3.0.0")
+    def predictLeaf(self, value):
+        """
+        Predict the indices of the leaves corresponding to the feature vector.
+        """
+        return self._call_java("predictLeaf", value)
 
 
-class DecisionTree(object):
+class _DecisionTreeParams(HasCheckpointInterval, HasSeed, HasWeightCol):
     """
-    Learning algorithm for a decision tree model for classification or
-    regression.
-
-    .. versionadded:: 1.1.0
+    Mixin for Decision Tree parameters.
     """
 
-    @classmethod
-    def _train(cls, data, type, numClasses, features, impurity="gini", maxDepth=5, maxBins=32,
-               minInstancesPerNode=1, minInfoGain=0.0):
-        first = data.first()
-        assert isinstance(first, LabeledPoint), "the data should be RDD of LabeledPoint"
-        model = callMLlibFunc("trainDecisionTreeModel", data, type, numClasses, features,
-                              impurity, maxDepth, maxBins, minInstancesPerNode, minInfoGain)
-        return DecisionTreeModel(model)
+    leafCol = Param(Params._dummy(), "leafCol", "Leaf indices column name. Predicted leaf " +
+                    "index of each instance in each tree by preorder.",
+                    typeConverter=TypeConverters.toString)
 
-    @classmethod
-    def trainClassifier(cls, data, numClasses, categoricalFeaturesInfo,
-                        impurity="gini", maxDepth=5, maxBins=32, minInstancesPerNode=1,
-                        minInfoGain=0.0):
+    maxDepth = Param(Params._dummy(), "maxDepth", "Maximum depth of the tree. (>= 0) E.g., " +
+                     "depth 0 means 1 leaf node; depth 1 means 1 internal node + 2 leaf nodes. " +
+                     "Must be in range [0, 30].",
+                     typeConverter=TypeConverters.toInt)
+
+    maxBins = Param(Params._dummy(), "maxBins", "Max number of bins for discretizing continuous " +
+                    "features.  Must be >=2 and >= number of categories for any categorical " +
+                    "feature.", typeConverter=TypeConverters.toInt)
+
+    minInstancesPerNode = Param(Params._dummy(), "minInstancesPerNode", "Minimum number of " +
+                                "instances each child must have after split. If a split causes " +
+                                "the left or right child to have fewer than " +
+                                "minInstancesPerNode, the split will be discarded as invalid. " +
+                                "Should be >= 1.", typeConverter=TypeConverters.toInt)
+
+    minWeightFractionPerNode = Param(Params._dummy(), "minWeightFractionPerNode", "Minimum "
+                                     "fraction of the weighted sample count that each child "
+                                     "must have after split. If a split causes the fraction "
+                                     "of the total weight in the left or right child to be "
+                                     "less than minWeightFractionPerNode, the split will be "
+                                     "discarded as invalid. Should be in interval [0.0, 0.5).",
+                                     typeConverter=TypeConverters.toFloat)
+
+    minInfoGain = Param(Params._dummy(), "minInfoGain", "Minimum information gain for a split " +
+                        "to be considered at a tree node.", typeConverter=TypeConverters.toFloat)
+
+    maxMemoryInMB = Param(Params._dummy(), "maxMemoryInMB", "Maximum memory in MB allocated to " +
+                          "histogram aggregation. If too small, then 1 node will be split per " +
+                          "iteration, and its aggregates may exceed this size.",
+                          typeConverter=TypeConverters.toInt)
+
+    cacheNodeIds = Param(Params._dummy(), "cacheNodeIds", "If false, the algorithm will pass " +
+                         "trees to executors to match instances with nodes. If true, the " +
+                         "algorithm will cache node IDs for each instance. Caching can speed " +
+                         "up training of deeper trees. Users can set how often should the cache " +
+                         "be checkpointed or disable it by setting checkpointInterval.",
+                         typeConverter=TypeConverters.toBoolean)
+
+    def __init__(self):
+        super(_DecisionTreeParams, self).__init__()
+
+    def setLeafCol(self, value):
         """
-        Train a decision tree model for classification.
-
-        .. versionadded:: 1.1.0
-
-        Parameters
-        ----------
-        data :  :py:class:`pyspark.RDD`
-            Training data: RDD of LabeledPoint. Labels should take values
-            {0, 1, ..., numClasses-1}.
-        numClasses : int
-            Number of classes for classification.
-        categoricalFeaturesInfo : dict
-            Map storing arity of categorical features. An entry (n -> k)
-            indicates that feature n is categorical with k categories
-            indexed from 0: {0, 1, ..., k-1}.
-        impurity : str, optional
-            Criterion used for information gain calculation.
-            Supported values: "gini" or "entropy".
-            (default: "gini")
-        maxDepth : int, optional
-            Maximum depth of tree (e.g. depth 0 means 1 leaf node, depth 1
-            means 1 internal node + 2 leaf nodes).
-            (default: 5)
-        maxBins : int, optional
-            Number of bins used for finding splits at each node.
-            (default: 32)
-        minInstancesPerNode : int, optional
-            Minimum number of instances required at child nodes to create
-            the parent split.
-            (default: 1)
-        minInfoGain : float, optional
-            Minimum info gain required to create a split.
-            (default: 0.0)
-
-        Returns
-        -------
-        :py:class:`DecisionTreeModel`
-
-        Examples
-        --------
-        >>> from numpy import array
-        >>> from pyspark.mllib.regression import LabeledPoint
-        >>> from pyspark.mllib.tree import DecisionTree
-        >>>
-        >>> data = [
-        ...     LabeledPoint(0.0, [0.0]),
-        ...     LabeledPoint(1.0, [1.0]),
-        ...     LabeledPoint(1.0, [2.0]),
-        ...     LabeledPoint(1.0, [3.0])
-        ... ]
-        >>> model = DecisionTree.trainClassifier(sc.parallelize(data), 2, {})
-        >>> print(model)
-        DecisionTreeModel classifier of depth 1 with 3 nodes
-
-        >>> print(model.toDebugString())
-        DecisionTreeModel classifier of depth 1 with 3 nodes
-          If (feature 0 <= 0.5)
-           Predict: 0.0
-          Else (feature 0 > 0.5)
-           Predict: 1.0
-        <BLANKLINE>
-        >>> model.predict(array([1.0]))
-        1.0
-        >>> model.predict(array([0.0]))
-        0.0
-        >>> rdd = sc.parallelize([[1.0], [0.0]])
-        >>> model.predict(rdd).collect()
-        [1.0, 0.0]
+        Sets the value of :py:attr:`leafCol`.
         """
-        return cls._train(data, "classification", numClasses, categoricalFeaturesInfo,
-                          impurity, maxDepth, maxBins, minInstancesPerNode, minInfoGain)
+        return self._set(leafCol=value)
 
-    @classmethod
-    @since("1.1.0")
-    def trainRegressor(cls, data, categoricalFeaturesInfo,
-                       impurity="variance", maxDepth=5, maxBins=32, minInstancesPerNode=1,
-                       minInfoGain=0.0):
+    def getLeafCol(self):
         """
-        Train a decision tree model for regression.
-
-        Parameters
-        ----------
-        data : :py:class:`pyspark.RDD`
-            Training data: RDD of LabeledPoint. Labels are real numbers.
-        categoricalFeaturesInfo : dict
-            Map storing arity of categorical features. An entry (n -> k)
-            indicates that feature n is categorical with k categories
-            indexed from 0: {0, 1, ..., k-1}.
-        impurity : str, optional
-            Criterion used for information gain calculation.
-            The only supported value for regression is "variance".
-            (default: "variance")
-        maxDepth : int, optional
-            Maximum depth of tree (e.g. depth 0 means 1 leaf node, depth 1
-            means 1 internal node + 2 leaf nodes).
-            (default: 5)
-        maxBins : int, optional
-            Number of bins used for finding splits at each node.
-            (default: 32)
-        minInstancesPerNode : int, optional
-            Minimum number of instances required at child nodes to create
-            the parent split.
-            (default: 1)
-        minInfoGain : float, optional
-            Minimum info gain required to create a split.
-            (default: 0.0)
-
-        Returns
-        -------
-        :py:class:`DecisionTreeModel`
-
-        Examples
-        --------
-        >>> from pyspark.mllib.regression import LabeledPoint
-        >>> from pyspark.mllib.tree import DecisionTree
-        >>> from pyspark.mllib.linalg import SparseVector
-        >>>
-        >>> sparse_data = [
-        ...     LabeledPoint(0.0, SparseVector(2, {0: 0.0})),
-        ...     LabeledPoint(1.0, SparseVector(2, {1: 1.0})),
-        ...     LabeledPoint(0.0, SparseVector(2, {0: 0.0})),
-        ...     LabeledPoint(1.0, SparseVector(2, {1: 2.0}))
-        ... ]
-        >>>
-        >>> model = DecisionTree.trainRegressor(sc.parallelize(sparse_data), {})
-        >>> model.predict(SparseVector(2, {1: 1.0}))
-        1.0
-        >>> model.predict(SparseVector(2, {1: 0.0}))
-        0.0
-        >>> rdd = sc.parallelize([[0.0, 1.0], [0.0, 0.0]])
-        >>> model.predict(rdd).collect()
-        [1.0, 0.0]
+        Gets the value of leafCol or its default value.
         """
-        return cls._train(data, "regression", 0, categoricalFeaturesInfo,
-                          impurity, maxDepth, maxBins, minInstancesPerNode, minInfoGain)
+        return self.getOrDefault(self.leafCol)
+
+    def getMaxDepth(self):
+        """
+        Gets the value of maxDepth or its default value.
+        """
+        return self.getOrDefault(self.maxDepth)
+
+    def getMaxBins(self):
+        """
+        Gets the value of maxBins or its default value.
+        """
+        return self.getOrDefault(self.maxBins)
+
+    def getMinInstancesPerNode(self):
+        """
+        Gets the value of minInstancesPerNode or its default value.
+        """
+        return self.getOrDefault(self.minInstancesPerNode)
+
+    def getMinWeightFractionPerNode(self):
+        """
+        Gets the value of minWeightFractionPerNode or its default value.
+        """
+        return self.getOrDefault(self.minWeightFractionPerNode)
+
+    def getMinInfoGain(self):
+        """
+        Gets the value of minInfoGain or its default value.
+        """
+        return self.getOrDefault(self.minInfoGain)
+
+    def getMaxMemoryInMB(self):
+        """
+        Gets the value of maxMemoryInMB or its default value.
+        """
+        return self.getOrDefault(self.maxMemoryInMB)
+
+    def getCacheNodeIds(self):
+        """
+        Gets the value of cacheNodeIds or its default value.
+        """
+        return self.getOrDefault(self.cacheNodeIds)
 
 
 @inherit_doc
-class RandomForestModel(TreeEnsembleModel, JavaLoader):
+class _TreeEnsembleModel(JavaPredictionModel):
     """
-    Represents a random forest model.
-
-    .. versionadded:: 1.2.0
-    """
-
-    @classmethod
-    def _java_loader_class(cls):
-        return "org.apache.spark.mllib.tree.model.RandomForestModel"
-
-
-class RandomForest(object):
-    """
-    Learning algorithm for a random forest model for classification or
-    regression.
-
-    .. versionadded:: 1.2.0
+    (private abstraction)
+    Represents a tree ensemble model.
     """
 
-    supportedFeatureSubsetStrategies = ("auto", "all", "sqrt", "log2", "onethird")
+    @property
+    @since("2.0.0")
+    def trees(self):
+        """Trees in this ensemble. Warning: These have null parent Estimators."""
+        return [_DecisionTreeModel(m) for m in list(self._call_java("trees"))]
 
-    @classmethod
-    def _train(cls, data, algo, numClasses, categoricalFeaturesInfo, numTrees,
-               featureSubsetStrategy, impurity, maxDepth, maxBins, seed):
-        first = data.first()
-        assert isinstance(first, LabeledPoint), "the data should be RDD of LabeledPoint"
-        if featureSubsetStrategy not in cls.supportedFeatureSubsetStrategies:
-            raise ValueError("unsupported featureSubsetStrategy: %s" % featureSubsetStrategy)
-        if seed is None:
-            seed = random.randint(0, 1 << 30)
-        model = callMLlibFunc("trainRandomForestModel", data, algo, numClasses,
-                              categoricalFeaturesInfo, numTrees, featureSubsetStrategy, impurity,
-                              maxDepth, maxBins, seed)
-        return RandomForestModel(model)
+    @property
+    @since("2.0.0")
+    def getNumTrees(self):
+        """Number of trees in ensemble."""
+        return self._call_java("getNumTrees")
 
-    @classmethod
-    def trainClassifier(cls, data, numClasses, categoricalFeaturesInfo, numTrees,
-                        featureSubsetStrategy="auto", impurity="gini", maxDepth=4, maxBins=32,
-                        seed=None):
+    @property
+    @since("1.5.0")
+    def treeWeights(self):
+        """Return the weights for each tree"""
+        return list(self._call_java("javaTreeWeights"))
+
+    @property
+    @since("2.0.0")
+    def totalNumNodes(self):
+        """Total number of nodes, summed over all trees in the ensemble."""
+        return self._call_java("totalNumNodes")
+
+    @property
+    @since("2.0.0")
+    def toDebugString(self):
+        """Full description of model."""
+        return self._call_java("toDebugString")
+
+    @since("3.0.0")
+    def predictLeaf(self, value):
         """
-        Train a random forest model for binary or multiclass
-        classification.
-
-        .. versionadded:: 1.2.0
-
-        Parameters
-        ----------
-        data : :py:class:`pyspark.RDD`
-            Training dataset: RDD of LabeledPoint. Labels should take values
-            {0, 1, ..., numClasses-1}.
-        numClasses : int
-            Number of classes for classification.
-        categoricalFeaturesInfo : dict
-            Map storing arity of categorical features. An entry (n -> k)
-            indicates that feature n is categorical with k categories
-            indexed from 0: {0, 1, ..., k-1}.
-        numTrees : int
-            Number of trees in the random forest.
-        featureSubsetStrategy : str, optional
-            Number of features to consider for splits at each node.
-            Supported values: "auto", "all", "sqrt", "log2", "onethird".
-            If "auto" is set, this parameter is set based on numTrees:
-            if numTrees == 1, set to "all";
-            if numTrees > 1 (forest) set to "sqrt".
-            (default: "auto")
-        impurity : str, optional
-            Criterion used for information gain calculation.
-            Supported values: "gini" or "entropy".
-            (default: "gini")
-        maxDepth : int, optional
-            Maximum depth of tree (e.g. depth 0 means 1 leaf node, depth 1
-            means 1 internal node + 2 leaf nodes).
-            (default: 4)
-        maxBins : int, optional
-            Maximum number of bins used for splitting features.
-            (default: 32)
-        seed : int, Optional
-            Random seed for bootstrapping and choosing feature subsets.
-            Set as None to generate seed based on system time.
-            (default: None)
-
-        Returns
-        -------
-        :py:class:`RandomForestModel`
-            that can be used for prediction.
-
-        Examples
-        --------
-        >>> from pyspark.mllib.regression import LabeledPoint
-        >>> from pyspark.mllib.tree import RandomForest
-        >>>
-        >>> data = [
-        ...     LabeledPoint(0.0, [0.0]),
-        ...     LabeledPoint(0.0, [1.0]),
-        ...     LabeledPoint(1.0, [2.0]),
-        ...     LabeledPoint(1.0, [3.0])
-        ... ]
-        >>> model = RandomForest.trainClassifier(sc.parallelize(data), 2, {}, 3, seed=42)
-        >>> model.numTrees()
-        3
-        >>> model.totalNumNodes()
-        7
-        >>> print(model)
-        TreeEnsembleModel classifier with 3 trees
-        <BLANKLINE>
-        >>> print(model.toDebugString())
-        TreeEnsembleModel classifier with 3 trees
-        <BLANKLINE>
-          Tree 0:
-            Predict: 1.0
-          Tree 1:
-            If (feature 0 <= 1.5)
-             Predict: 0.0
-            Else (feature 0 > 1.5)
-             Predict: 1.0
-          Tree 2:
-            If (feature 0 <= 1.5)
-             Predict: 0.0
-            Else (feature 0 > 1.5)
-             Predict: 1.0
-        <BLANKLINE>
-        >>> model.predict([2.0])
-        1.0
-        >>> model.predict([0.0])
-        0.0
-        >>> rdd = sc.parallelize([[3.0], [1.0]])
-        >>> model.predict(rdd).collect()
-        [1.0, 0.0]
+        Predict the indices of the leaves corresponding to the feature vector.
         """
-        return cls._train(data, "classification", numClasses,
-                          categoricalFeaturesInfo, numTrees, featureSubsetStrategy, impurity,
-                          maxDepth, maxBins, seed)
-
-    @classmethod
-    def trainRegressor(cls, data, categoricalFeaturesInfo, numTrees, featureSubsetStrategy="auto",
-                       impurity="variance", maxDepth=4, maxBins=32, seed=None):
-        """
-        Train a random forest model for regression.
-
-        .. versionadded:: 1.2.0
-
-        Parameters
-        ----------
-        data : :py:class:`pyspark.RDD`
-            Training dataset: RDD of LabeledPoint. Labels are real numbers.
-        categoricalFeaturesInfo : dict
-            Map storing arity of categorical features. An entry (n -> k)
-            indicates that feature n is categorical with k categories
-            indexed from 0: {0, 1, ..., k-1}.
-        numTrees : int
-            Number of trees in the random forest.
-        featureSubsetStrategy : str, optional
-            Number of features to consider for splits at each node.
-            Supported values: "auto", "all", "sqrt", "log2", "onethird".
-            If "auto" is set, this parameter is set based on numTrees:
-
-            - if numTrees == 1, set to "all";
-            - if numTrees > 1 (forest) set to "onethird" for regression.
-
-            (default: "auto")
-        impurity : str, optional
-            Criterion used for information gain calculation.
-            The only supported value for regression is "variance".
-            (default: "variance")
-        maxDepth : int, optional
-            Maximum depth of tree (e.g. depth 0 means 1 leaf node, depth 1
-            means 1 internal node + 2 leaf nodes).
-            (default: 4)
-        maxBins : int, optional
-            Maximum number of bins used for splitting features.
-            (default: 32)
-        seed : int, optional
-            Random seed for bootstrapping and choosing feature subsets.
-            Set as None to generate seed based on system time.
-            (default: None)
-
-        Returns
-        -------
-        :py:class:`RandomForestModel`
-            that can be used for prediction.
-
-        Examples
-        --------
-        >>> from pyspark.mllib.regression import LabeledPoint
-        >>> from pyspark.mllib.tree import RandomForest
-        >>> from pyspark.mllib.linalg import SparseVector
-        >>>
-        >>> sparse_data = [
-        ...     LabeledPoint(0.0, SparseVector(2, {0: 1.0})),
-        ...     LabeledPoint(1.0, SparseVector(2, {1: 1.0})),
-        ...     LabeledPoint(0.0, SparseVector(2, {0: 1.0})),
-        ...     LabeledPoint(1.0, SparseVector(2, {1: 2.0}))
-        ... ]
-        >>>
-        >>> model = RandomForest.trainRegressor(sc.parallelize(sparse_data), {}, 2, seed=42)
-        >>> model.numTrees()
-        2
-        >>> model.totalNumNodes()
-        4
-        >>> model.predict(SparseVector(2, {1: 1.0}))
-        1.0
-        >>> model.predict(SparseVector(2, {0: 1.0}))
-        0.5
-        >>> rdd = sc.parallelize([[0.0, 1.0], [1.0, 0.0]])
-        >>> model.predict(rdd).collect()
-        [1.0, 0.5]
-        """
-        return cls._train(data, "regression", 0, categoricalFeaturesInfo, numTrees,
-                          featureSubsetStrategy, impurity, maxDepth, maxBins, seed)
+        return self._call_java("predictLeaf", value)
 
 
-@inherit_doc
-class GradientBoostedTreesModel(TreeEnsembleModel, JavaLoader):
+class _TreeEnsembleParams(_DecisionTreeParams):
     """
-    Represents a gradient-boosted tree model.
-
-    .. versionadded:: 1.3.0
+    Mixin for Decision Tree-based ensemble algorithms parameters.
     """
 
-    @classmethod
-    def _java_loader_class(cls):
-        return "org.apache.spark.mllib.tree.model.GradientBoostedTreesModel"
+    subsamplingRate = Param(Params._dummy(), "subsamplingRate", "Fraction of the training data " +
+                            "used for learning each decision tree, in range (0, 1].",
+                            typeConverter=TypeConverters.toFloat)
+
+    supportedFeatureSubsetStrategies = ["auto", "all", "onethird", "sqrt", "log2"]
+
+    featureSubsetStrategy = \
+        Param(Params._dummy(), "featureSubsetStrategy",
+              "The number of features to consider for splits at each tree node. Supported " +
+              "options: 'auto' (choose automatically for task: If numTrees == 1, set to " +
+              "'all'. If numTrees > 1 (forest), set to 'sqrt' for classification and to " +
+              "'onethird' for regression), 'all' (use all features), 'onethird' (use " +
+              "1/3 of the features), 'sqrt' (use sqrt(number of features)), 'log2' (use " +
+              "log2(number of features)), 'n' (when n is in the range (0, 1.0], use " +
+              "n * number of features. When n is in the range (1, number of features), use" +
+              " n features). default = 'auto'", typeConverter=TypeConverters.toString)
+
+    def __init__(self):
+        super(_TreeEnsembleParams, self).__init__()
+
+    @since("1.4.0")
+    def getSubsamplingRate(self):
+        """
+        Gets the value of subsamplingRate or its default value.
+        """
+        return self.getOrDefault(self.subsamplingRate)
+
+    @since("1.4.0")
+    def getFeatureSubsetStrategy(self):
+        """
+        Gets the value of featureSubsetStrategy or its default value.
+        """
+        return self.getOrDefault(self.featureSubsetStrategy)
 
 
-class GradientBoostedTrees(object):
+class _RandomForestParams(_TreeEnsembleParams):
     """
-    Learning algorithm for a gradient boosted trees model for
-    classification or regression.
-
-    .. versionadded:: 1.3.0
+    Private class to track supported random forest parameters.
     """
 
-    @classmethod
-    def _train(cls, data, algo, categoricalFeaturesInfo,
-               loss, numIterations, learningRate, maxDepth, maxBins):
-        first = data.first()
-        assert isinstance(first, LabeledPoint), "the data should be RDD of LabeledPoint"
-        model = callMLlibFunc("trainGradientBoostedTreesModel", data, algo, categoricalFeaturesInfo,
-                              loss, numIterations, learningRate, maxDepth, maxBins)
-        return GradientBoostedTreesModel(model)
+    numTrees = Param(Params._dummy(), "numTrees", "Number of trees to train (>= 1).",
+                     typeConverter=TypeConverters.toInt)
 
-    @classmethod
-    def trainClassifier(cls, data, categoricalFeaturesInfo,
-                        loss="logLoss", numIterations=100, learningRate=0.1, maxDepth=3,
-                        maxBins=32):
+    bootstrap = Param(Params._dummy(), "bootstrap", "Whether bootstrap samples are used "
+                      "when building trees.", typeConverter=TypeConverters.toBoolean)
+
+    def __init__(self):
+        super(_RandomForestParams, self).__init__()
+
+    @since("1.4.0")
+    def getNumTrees(self):
         """
-        Train a gradient-boosted trees model for classification.
-
-        .. versionadded:: 1.3.0
-
-        Parameters
-        ----------
-        data : :py:class:`pyspark.RDD`
-            Training dataset: RDD of LabeledPoint. Labels should take values
-            {0, 1}.
-        categoricalFeaturesInfo : dict
-            Map storing arity of categorical features. An entry (n -> k)
-            indicates that feature n is categorical with k categories
-            indexed from 0: {0, 1, ..., k-1}.
-        loss : str, optional
-            Loss function used for minimization during gradient boosting.
-            Supported values: "logLoss", "leastSquaresError",
-            "leastAbsoluteError".
-            (default: "logLoss")
-        numIterations : int, optional
-            Number of iterations of boosting.
-            (default: 100)
-        learningRate : float, optional
-            Learning rate for shrinking the contribution of each estimator.
-            The learning rate should be between in the interval (0, 1].
-            (default: 0.1)
-        maxDepth : int, optional
-            Maximum depth of tree (e.g. depth 0 means 1 leaf node, depth 1
-            means 1 internal node + 2 leaf nodes).
-            (default: 3)
-        maxBins : int, optional
-            Maximum number of bins used for splitting features. DecisionTree
-            requires maxBins >= max categories.
-            (default: 32)
-
-        Returns
-        -------
-        :py:class:`GradientBoostedTreesModel`
-            that can be used for prediction.
-
-        Examples
-        --------
-        >>> from pyspark.mllib.regression import LabeledPoint
-        >>> from pyspark.mllib.tree import GradientBoostedTrees
-        >>>
-        >>> data = [
-        ...     LabeledPoint(0.0, [0.0]),
-        ...     LabeledPoint(0.0, [1.0]),
-        ...     LabeledPoint(1.0, [2.0]),
-        ...     LabeledPoint(1.0, [3.0])
-        ... ]
-        >>>
-        >>> model = GradientBoostedTrees.trainClassifier(sc.parallelize(data), {}, numIterations=10)
-        >>> model.numTrees()
-        10
-        >>> model.totalNumNodes()
-        30
-        >>> print(model)  # it already has newline
-        TreeEnsembleModel classifier with 10 trees
-        <BLANKLINE>
-        >>> model.predict([2.0])
-        1.0
-        >>> model.predict([0.0])
-        0.0
-        >>> rdd = sc.parallelize([[2.0], [0.0]])
-        >>> model.predict(rdd).collect()
-        [1.0, 0.0]
+        Gets the value of numTrees or its default value.
         """
-        return cls._train(data, "classification", categoricalFeaturesInfo,
-                          loss, numIterations, learningRate, maxDepth, maxBins)
+        return self.getOrDefault(self.numTrees)
 
-    @classmethod
-    def trainRegressor(cls, data, categoricalFeaturesInfo,
-                       loss="leastSquaresError", numIterations=100, learningRate=0.1, maxDepth=3,
-                       maxBins=32):
+    @since("3.0.0")
+    def getBootstrap(self):
         """
-        Train a gradient-boosted trees model for regression.
-
-        .. versionadded:: 1.3.0
-
-        Parameters
-        ----------
-        data :
-            Training dataset: RDD of LabeledPoint. Labels are real numbers.
-        categoricalFeaturesInfo : dict
-            Map storing arity of categorical features. An entry (n -> k)
-            indicates that feature n is categorical with k categories
-            indexed from 0: {0, 1, ..., k-1}.
-        loss : str, optional
-            Loss function used for minimization during gradient boosting.
-            Supported values: "logLoss", "leastSquaresError",
-            "leastAbsoluteError".
-            (default: "leastSquaresError")
-        numIterations : int, optional
-            Number of iterations of boosting.
-            (default: 100)
-        learningRate : float, optional
-            Learning rate for shrinking the contribution of each estimator.
-            The learning rate should be between in the interval (0, 1].
-            (default: 0.1)
-        maxDepth : int, optional
-            Maximum depth of tree (e.g. depth 0 means 1 leaf node, depth 1
-            means 1 internal node + 2 leaf nodes).
-            (default: 3)
-        maxBins : int, optional
-            Maximum number of bins used for splitting features. DecisionTree
-            requires maxBins >= max categories.
-            (default: 32)
-
-        Returns
-        -------
-        :py:class:`GradientBoostedTreesModel`
-            that can be used for prediction.
-
-        Examples
-        --------
-        >>> from pyspark.mllib.regression import LabeledPoint
-        >>> from pyspark.mllib.tree import GradientBoostedTrees
-        >>> from pyspark.mllib.linalg import SparseVector
-        >>>
-        >>> sparse_data = [
-        ...     LabeledPoint(0.0, SparseVector(2, {0: 1.0})),
-        ...     LabeledPoint(1.0, SparseVector(2, {1: 1.0})),
-        ...     LabeledPoint(0.0, SparseVector(2, {0: 1.0})),
-        ...     LabeledPoint(1.0, SparseVector(2, {1: 2.0}))
-        ... ]
-        >>>
-        >>> data = sc.parallelize(sparse_data)
-        >>> model = GradientBoostedTrees.trainRegressor(data, {}, numIterations=10)
-        >>> model.numTrees()
-        10
-        >>> model.totalNumNodes()
-        12
-        >>> model.predict(SparseVector(2, {1: 1.0}))
-        1.0
-        >>> model.predict(SparseVector(2, {0: 1.0}))
-        0.0
-        >>> rdd = sc.parallelize([[0.0, 1.0], [1.0, 0.0]])
-        >>> model.predict(rdd).collect()
-        [1.0, 0.0]
+        Gets the value of bootstrap or its default value.
         """
-        return cls._train(data, "regression", categoricalFeaturesInfo,
-                          loss, numIterations, learningRate, maxDepth, maxBins)
+        return self.getOrDefault(self.bootstrap)
 
 
-def _test():
-    import doctest
-    globs = globals().copy()
-    from pyspark.sql import SparkSession
-    spark = SparkSession.builder\
-        .master("local[4]")\
-        .appName("mllib.tree tests")\
-        .getOrCreate()
-    globs['sc'] = spark.sparkContext
-    (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
-    spark.stop()
-    if failure_count:
-        sys.exit(-1)
+class _GBTParams(_TreeEnsembleParams, HasMaxIter, HasStepSize, HasValidationIndicatorCol):
+    """
+    Private class to track supported GBT params.
+    """
 
-if __name__ == "__main__":
-    _test()
+    stepSize = Param(Params._dummy(), "stepSize",
+                     "Step size (a.k.a. learning rate) in interval (0, 1] for shrinking " +
+                     "the contribution of each estimator.",
+                     typeConverter=TypeConverters.toFloat)
+
+    validationTol = Param(Params._dummy(), "validationTol",
+                          "Threshold for stopping early when fit with validation is used. " +
+                          "If the error rate on the validation input changes by less than the " +
+                          "validationTol, then learning will stop early (before `maxIter`). " +
+                          "This parameter is ignored when fit without validation is used.",
+                          typeConverter=TypeConverters.toFloat)
+
+    @since("3.0.0")
+    def getValidationTol(self):
+        """
+        Gets the value of validationTol or its default value.
+        """
+        return self.getOrDefault(self.validationTol)
+
+
+class _HasVarianceImpurity(Params):
+    """
+    Private class to track supported impurity measures.
+    """
+
+    supportedImpurities = ["variance"]
+
+    impurity = Param(Params._dummy(), "impurity",
+                     "Criterion used for information gain calculation (case-insensitive). " +
+                     "Supported options: " +
+                     ", ".join(supportedImpurities), typeConverter=TypeConverters.toString)
+
+    def __init__(self):
+        super(_HasVarianceImpurity, self).__init__()
+
+    @since("1.4.0")
+    def getImpurity(self):
+        """
+        Gets the value of impurity or its default value.
+        """
+        return self.getOrDefault(self.impurity)
+
+
+class _TreeClassifierParams(Params):
+    """
+    Private class to track supported impurity measures.
+
+    .. versionadded:: 1.4.0
+    """
+
+    supportedImpurities = ["entropy", "gini"]
+
+    impurity = Param(Params._dummy(), "impurity",
+                     "Criterion used for information gain calculation (case-insensitive). " +
+                     "Supported options: " +
+                     ", ".join(supportedImpurities), typeConverter=TypeConverters.toString)
+
+    def __init__(self):
+        super(_TreeClassifierParams, self).__init__()
+
+    @since("1.6.0")
+    def getImpurity(self):
+        """
+        Gets the value of impurity or its default value.
+        """
+        return self.getOrDefault(self.impurity)
+
+
+class _TreeRegressorParams(_HasVarianceImpurity):
+    """
+    Private class to track supported impurity measures.
+    """
+    pass
