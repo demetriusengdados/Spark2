@@ -15,119 +15,45 @@
 # limitations under the License.
 #
 
-import py4j.protocol
-from py4j.protocol import Py4JJavaError
-from py4j.java_gateway import JavaObject
-from py4j.java_collections import JavaArray, JavaList
 
-from pyspark import RDD, SparkContext
-from pyspark.serializers import PickleSerializer, AutoBatchedSerializer
-from pyspark.sql import DataFrame, SQLContext
+memory_usage = lambda f: f(
+    "memory_usage",
+    reason="Unlike pandas, most DataFrames are not materialized in memory in Spark "
+    "(and pandas-on-Spark), and as a result memory_usage() does not do what you intend it "
+    "to do. Use Spark's web UI to monitor disk and memory usage of your application.",
+)
 
-# Hack for support float('inf') in Py4j
-_old_smart_decode = py4j.protocol.smart_decode
+array = lambda f: f(
+    "array", reason="If you want to collect your data as an NumPy array, use 'to_numpy()' instead."
+)
 
-_float_str_mapping = {
-    'nan': 'NaN',
-    'inf': 'Infinity',
-    '-inf': '-Infinity',
-}
+to_pickle = lambda f: f(
+    "to_pickle",
+    reason="For storage, we encourage you to use Delta or Parquet, instead of Python pickle "
+    "format.",
+)
 
+to_xarray = lambda f: f(
+    "to_xarray",
+    reason="If you want to collect your data as an NumPy array, use 'to_numpy()' instead.",
+)
 
-def _new_smart_decode(obj):
-    if isinstance(obj, float):
-        s = str(obj)
-        return _float_str_mapping.get(s, s)
-    return _old_smart_decode(obj)
+to_list = lambda f: f(
+    "to_list",
+    reason="If you want to collect your data as an NumPy array, use 'to_numpy()' instead.",
+)
 
-py4j.protocol.smart_decode = _new_smart_decode
+tolist = lambda f: f(
+    "tolist", reason="If you want to collect your data as an NumPy array, use 'to_numpy()' instead."
+)
 
+__iter__ = lambda f: f(
+    "__iter__",
+    reason="If you want to collect your data as an NumPy array, use 'to_numpy()' instead.",
+)
 
-_picklable_classes = [
-    'SparseVector',
-    'DenseVector',
-    'SparseMatrix',
-    'DenseMatrix',
-]
-
-
-# this will call the ML version of pythonToJava()
-def _to_java_object_rdd(rdd):
-    """ Return an JavaRDD of Object by unpickling
-
-    It will convert each Python object into Java object by Pyrolite, whenever the
-    RDD is serialized in batch or not.
-    """
-    rdd = rdd._reserialize(AutoBatchedSerializer(PickleSerializer()))
-    return rdd.ctx._jvm.org.apache.spark.ml.python.MLSerDe.pythonToJava(rdd._jrdd, True)
-
-
-def _py2java(sc, obj):
-    """ Convert Python object into Java """
-    if isinstance(obj, RDD):
-        obj = _to_java_object_rdd(obj)
-    elif isinstance(obj, DataFrame):
-        obj = obj._jdf
-    elif isinstance(obj, SparkContext):
-        obj = obj._jsc
-    elif isinstance(obj, list):
-        obj = [_py2java(sc, x) for x in obj]
-    elif isinstance(obj, JavaObject):
-        pass
-    elif isinstance(obj, (int, float, bool, bytes, str)):
-        pass
-    else:
-        data = bytearray(PickleSerializer().dumps(obj))
-        obj = sc._jvm.org.apache.spark.ml.python.MLSerDe.loads(data)
-    return obj
-
-
-def _java2py(sc, r, encoding="bytes"):
-    if isinstance(r, JavaObject):
-        clsName = r.getClass().getSimpleName()
-        # convert RDD into JavaRDD
-        if clsName != 'JavaRDD' and clsName.endswith("RDD"):
-            r = r.toJavaRDD()
-            clsName = 'JavaRDD'
-
-        if clsName == 'JavaRDD':
-            jrdd = sc._jvm.org.apache.spark.ml.python.MLSerDe.javaToPython(r)
-            return RDD(jrdd, sc)
-
-        if clsName == 'Dataset':
-            return DataFrame(r, SQLContext.getOrCreate(sc))
-
-        if clsName in _picklable_classes:
-            r = sc._jvm.org.apache.spark.ml.python.MLSerDe.dumps(r)
-        elif isinstance(r, (JavaArray, JavaList)):
-            try:
-                r = sc._jvm.org.apache.spark.ml.python.MLSerDe.dumps(r)
-            except Py4JJavaError:
-                pass  # not pickable
-
-    if isinstance(r, (bytearray, bytes)):
-        r = PickleSerializer().loads(bytes(r), encoding=encoding)
-    return r
-
-
-def callJavaFunc(sc, func, *args):
-    """ Call Java Function """
-    args = [_py2java(sc, a) for a in args]
-    return _java2py(sc, func(*args))
-
-
-def inherit_doc(cls):
-    """
-    A decorator that makes a class inherit documentation from its parents.
-    """
-    for name, func in vars(cls).items():
-        # only inherit docstring for public functions
-        if name.startswith("_"):
-            continue
-        if not func.__doc__:
-            for parent in cls.__bases__:
-                parent_func = getattr(parent, name, None)
-                if parent_func and getattr(parent_func, "__doc__", None):
-                    func.__doc__ = parent_func.__doc__
-                    break
-    return cls
+duplicated = lambda f: f(
+    "duplicated",
+    reason="'duplicated' API returns np.ndarray and the data size is too large."
+    "You can just use DataFrame.deduplicated instead",
+)
